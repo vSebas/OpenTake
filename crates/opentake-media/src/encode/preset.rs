@@ -3,6 +3,12 @@
 //! (`docs/_analysis/02` §1.3). `opentake-render` owns the wgpu frame compositing
 //! and the even-size decision; this crate only encodes already-even RGBA frames.
 
+/// True when `OPENTAKE_NVENC` is set (checked once per process).
+fn nvenc_requested() -> bool {
+    static NVENC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NVENC.get_or_init(|| std::env::var_os("OPENTAKE_NVENC").is_some())
+}
+
 /// Output video codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -45,10 +51,26 @@ impl ExportPreset {
     }
 
     /// ffmpeg `-c:v` codec token.
+    ///
+    /// `OPENTAKE_NVENC=1` opts H.264/H.265 into NVIDIA's hardware encoder.
+    /// Explicit opt-in rather than detection: a wrong guess would fail the
+    /// export, and the presets otherwise stay byte-identical to upstream.
     pub fn vcodec_arg(&self) -> &'static str {
         match self.codec {
-            VideoCodec::H264 => "libx264",
-            VideoCodec::H265 => "libx265",
+            VideoCodec::H264 => {
+                if nvenc_requested() {
+                    "h264_nvenc"
+                } else {
+                    "libx264"
+                }
+            }
+            VideoCodec::H265 => {
+                if nvenc_requested() {
+                    "hevc_nvenc"
+                } else {
+                    "libx265"
+                }
+            }
             VideoCodec::ProRes422 => "prores_ks",
             VideoCodec::ProRes4444 => "prores_ks",
         }
