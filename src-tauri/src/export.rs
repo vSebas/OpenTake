@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use same_file::Handle as FileIdentity;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::render::LottieMaterializer;
 
@@ -1291,16 +1291,33 @@ pub(crate) fn write_timeline_audio_wav_for_manifest_with_control(
 /// to opaque black, which is the correct clear color, not an error.
 ///
 /// Emits throttled `"export://progress"` events via `app` and polls `control`
-/// for a mid-encode cancel every frame (see the module doc). This is a sync
-/// (non-`async`) command, so Tauri runs it on a worker thread — `cancel_export`
-/// (and the WebView's event loop delivering `"export://progress"`) keep running
-/// concurrently while this call is in flight.
+/// for a mid-encode cancel every frame (see the module doc). The async wrapper
+/// delegates the blocking render loop to Tauri's blocking pool so Linux/wry's
+/// GTK main thread remains free to deliver progress events and cancellation IPC.
 ///
 /// GPU acquisition / decode / encode failures surface to the front-end as
 /// `Err(String)` (the Tauri boundary contract); a mid-export cancel surfaces as
 /// `Err(`[`CANCELLED_SENTINEL`]`)`.
 #[tauri::command]
-pub fn export_video(
+pub async fn export_video(
+    app: AppHandle,
+    req: ExportRequest,
+    operation_id: String,
+) -> Result<ExportSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_video_blocking(
+            app.clone(),
+            app.state::<AppCore>(),
+            app.state::<ExportControl>(),
+            req,
+            operation_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("export worker failed: {error}"))?
+}
+
+fn export_video_blocking(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,
@@ -2430,7 +2447,25 @@ pub struct SaveRangeAsMediaRequest {
 }
 
 #[tauri::command]
-pub fn save_range_as_media(
+pub async fn save_range_as_media(
+    app: AppHandle,
+    request: SaveRangeAsMediaRequest,
+) -> Result<crate::media::MediaListDto, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_range_as_media_blocking(
+            app.clone(),
+            app.state::<AppCore>(),
+            app.state::<ExportControl>(),
+            app.state::<crate::media::MediaState>(),
+            app.state::<crate::media::prewarm::PrewarmScheduler>(),
+            request,
+        )
+    })
+    .await
+    .map_err(|error| format!("save range worker failed: {error}"))?
+}
+
+fn save_range_as_media_blocking(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, ExportControl>,

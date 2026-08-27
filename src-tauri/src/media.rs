@@ -3388,7 +3388,27 @@ fn build_single_clip_export(
 /// extraction already exists via `extract_audio`). Requires a saved project —
 /// there must be a bundle `media/` dir to write into.
 #[tauri::command]
-pub fn save_clip_as_media(
+pub async fn save_clip_as_media(
+    app: AppHandle,
+    clip_id: String,
+    operation_id: String,
+) -> Result<MediaListDto, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_clip_as_media_blocking(
+            app.clone(),
+            app.state::<AppCore>(),
+            app.state::<crate::export::ExportControl>(),
+            app.state::<MediaState>(),
+            app.state::<prewarm::PrewarmScheduler>(),
+            clip_id,
+            operation_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("save clip worker failed: {error}"))?
+}
+
+fn save_clip_as_media_blocking(
     app: AppHandle,
     core: State<'_, AppCore>,
     control: State<'_, crate::export::ExportControl>,
