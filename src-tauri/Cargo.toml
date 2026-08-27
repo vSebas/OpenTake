@@ -47,7 +47,10 @@ opentake-domain = { workspace = true }
 # the opentake-media level (its own default tests run offline, without them);
 # ort-inference tests are feature-gated + runtime-skipped like the GPU/ffmpeg
 # integration tests.
-opentake-media = { workspace = true, features = ["whisper-backend", "ort-backend", "model-download"] }
+# whisper-backend is off by default on this fork: whisper-rs-sys bindings
+# miscompile under new libclang, and transcripts come from the external ASR
+# pipeline. Re-enable with `--features whisper` once upstream builds again.
+opentake-media = { workspace = true, features = ["ort-backend", "model-download"] }
 opentake-render = { workspace = true }
 opentake-gen = { workspace = true }
 opentake-agent = { workspace = true }
@@ -139,6 +142,8 @@ external-mcp-integration = []
 # cpal/axum/bytes/futures + the `playback_*` commands; the front-end flag then falls back
 # to the legacy <video> path — see web/src/components/preview/rustEngine.ts).
 default = ["playback-engine"]
+# Restores the in-app whisper.cpp transcription backend.
+whisper = ["opentake-media/whisper-backend"]
 # this feature is used for production builds or when `devUrl` is not set
 custom-protocol = ["tauri/custom-protocol"]
 # Continuous Rust streaming playback engine (#53): continuous per-clip decode →

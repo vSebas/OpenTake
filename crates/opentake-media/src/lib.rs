@@ -203,7 +203,6 @@ pub use transcribe::{
     TranscribeOptions, Transcriber, TranscriptionResult, TranscriptionSegment, TranscriptionWord,
 };
 
-#[cfg(feature = "whisper-backend")]
 pub use transcribe::whisper::WhisperTranscriber;
 
 pub use search::{

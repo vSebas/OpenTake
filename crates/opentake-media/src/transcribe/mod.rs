@@ -16,6 +16,9 @@ pub mod timeline;
 
 #[cfg(feature = "whisper-backend")]
 pub mod whisper;
+#[cfg(not(feature = "whisper-backend"))]
+#[path = "whisper_stub.rs"]
+pub mod whisper;
 
 use std::path::Path;
 
