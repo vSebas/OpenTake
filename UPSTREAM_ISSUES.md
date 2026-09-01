@@ -42,3 +42,13 @@ pool + circuit breaker (happy to PR).
 - Compositor horizontally squeezes wide (16:9) sources placed in a portrait
   project instead of letterboxing.
 - Native menu does not rebuild on language switch (restart applies it).
+
+## 5. set_clip_properties on one linked clip silently mutates its partner
+
+Probed live 2026-09-01 (v1.0.0-beta.5 + trial patches): changing
+`trimStartFrame` on the AUDIO clip of a linked pair returns success, but the
+change is propagated to the linked VIDEO clip as well — the caller asked to
+modify one clip and two changed, with no indication in the response. Either
+refusing divergence explicitly or reporting the propagated change would be
+honest; silent partner mutation is neither. (Fork batch 2 replaces this
+behavior with explicit link-divergence semantics for J/L cuts.)
