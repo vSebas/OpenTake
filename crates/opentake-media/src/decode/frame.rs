@@ -15,7 +15,9 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use ffmpeg_sidecar::event::FfmpegEvent;
+use ffmpeg_sidecar::child::FfmpegChild;
+use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
+use ffmpeg_sidecar::iter::FfmpegIterator;
 use image::ImageEncoder;
 
 use crate::cancel::MediaCancelToken;
@@ -445,6 +447,82 @@ fn frame_args_with_color(
     args.push("rawvideo".into());
     args.push("-".into());
     args
+}
+
+fn frame_stream_args_with_color(
+    path: &Path,
+    req: &FrameRequest,
+    color: Option<&opentake_domain::MediaColorMetadata>,
+) -> Vec<String> {
+    let mut args = frame_args_with_color(path, req, color);
+    let frame_limit = args
+        .iter()
+        .rposition(|argument| argument == "-frames:v")
+        .expect("frame args always contain a frame limit");
+    args.drain(frame_limit..frame_limit + 2);
+    args
+}
+
+/// Long-lived counterpart to [`decode_frame_at`]. It uses the same seek and
+/// filter chain, but yields every raw frame after the requested start time.
+pub struct FrameDecodeStream {
+    child: FfmpegChild,
+    iter: FfmpegIterator,
+}
+
+impl FrameDecodeStream {
+    pub fn spawn(path: &Path, req: &FrameRequest) -> Result<Self> {
+        let color = path
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|_| crate::probe::probe(path).ok())
+            .and_then(|probe| probe.color);
+        let mut child = ff::ffmpeg()
+            .args(frame_stream_args_with_color(path, req, color.as_ref()))
+            .spawn()
+            .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
+        let iter = match child.iter() {
+            Ok(iter) => iter,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MediaError::Ffmpeg(format!("iter: {error}")));
+            }
+        };
+        Ok(FrameDecodeStream { child, iter })
+    }
+
+    pub fn next_frame(&mut self) -> Result<RgbaFrame> {
+        for event in self.iter.by_ref() {
+            match event {
+                FfmpegEvent::OutputFrame(frame) if frame.width > 0 && frame.height > 0 => {
+                    return Ok(RgbaFrame::new(frame.width, frame.height, frame.data));
+                }
+                FfmpegEvent::Error(error) | FfmpegEvent::Log(LogLevel::Error, error) => {
+                    return Err(MediaError::Ffmpeg(error));
+                }
+                FfmpegEvent::Done => break,
+                _ => {}
+            }
+        }
+        Err(MediaError::Decode("frame stream ended".to_string()))
+    }
+
+    pub fn is_alive(&mut self) -> Result<bool> {
+        self.child
+            .as_inner_mut()
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(MediaError::Io)
+    }
+}
+
+impl Drop for FrameDecodeStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn frame_args_for_input(
@@ -902,6 +980,27 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-f", "rawvideo"]));
         assert!(args.windows(2).any(|w| w == ["-frames:v", "1"]));
         assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn frame_stream_args_only_remove_the_single_frame_limit() {
+        let path = Path::new("/x.mp4");
+        let request = FrameRequest {
+            time_secs: 2.5,
+            max_size: (1920, 1080),
+            tolerance_secs: 0.0,
+            apply_rotation: true,
+        };
+        let mut expected = frame_args(path, &request);
+        let frame_limit = expected
+            .iter()
+            .rposition(|argument| argument == "-frames:v")
+            .unwrap();
+        expected.drain(frame_limit..frame_limit + 2);
+
+        let actual = frame_stream_args_with_color(path, &request, None);
+        assert_eq!(actual, expected);
+        assert!(!actual.iter().any(|argument| argument == "-frames:v"));
     }
 
     #[test]

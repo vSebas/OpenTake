@@ -32,7 +32,7 @@
 //! preview path in `render.rs` is not touched). A later refactor can hoist the
 //! shared projection into a `pub(crate)` helper once both paths are stable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -52,13 +52,14 @@ use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
 use opentake_domain::{AudioDenoise, Clip, ClipType, LutReference, MediaSource, TextStyle};
+use opentake_media::decode::frame::FrameDecodeStream;
 #[cfg(test)]
 use opentake_media::encode::ClipAudio;
 use opentake_media::encode::{mix, MIX_SAMPLE_RATE};
 use opentake_media::{
     decode_frame_at, extract_pcm, extract_pcm_cancellable_with_progress, interpolate_frame_pair,
     probe, ExportPreset, ExportResolution as EncodeResolution, FrameInterpolationFallback,
-    FrameInterpolationMode, FrameRequest, MediaCancelToken, PcmBuffer, PcmFormat,
+    FrameInterpolationMode, FrameRequest, MediaCancelToken, MediaError, PcmBuffer, PcmFormat,
     PcmProgressCallback, PcmSpec, RgbaFrame, VideoCodec, VideoEncoder,
 };
 use opentake_project::ProjectRoot;
@@ -77,6 +78,7 @@ use opentake_render::{
 /// hit rate is low; a small cache still helps text/image layers re-used across
 /// frames. Bounds VRAM during the export loop.
 const TEXTURE_CACHE_CAP: usize = 64;
+const FRAME_SERVER_CACHE_CAP: usize = 2;
 const AUDIO_STREAM_WINDOW_SAMPLES: usize = MIX_SAMPLE_RATE as usize * 2;
 
 /// Requested output codec, projected from the front-end.
@@ -471,6 +473,144 @@ impl SourceMetrics for ManifestMetrics {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameServerConfig {
+    path: PathBuf,
+    source_fps_bits: u64,
+    max_size: (u32, u32),
+    apply_rotation: bool,
+}
+
+impl FrameServerConfig {
+    fn new(path: PathBuf, source_fps: f64, max_size: (u32, u32)) -> Self {
+        FrameServerConfig {
+            path,
+            source_fps_bits: source_fps.to_bits(),
+            max_size,
+            apply_rotation: true,
+        }
+    }
+
+    fn request(&self, source_frame: i64) -> FrameRequest {
+        FrameRequest {
+            time_secs: source_frame.max(0) as f64 / f64::from_bits(self.source_fps_bits),
+            max_size: self.max_size,
+            tolerance_secs: 0.0,
+            apply_rotation: self.apply_rotation,
+        }
+    }
+}
+
+trait FrameServerStream {
+    fn next_frame(&mut self) -> opentake_media::Result<RgbaFrame>;
+    fn is_alive(&mut self) -> opentake_media::Result<bool>;
+}
+
+impl FrameServerStream for FrameDecodeStream {
+    fn next_frame(&mut self) -> opentake_media::Result<RgbaFrame> {
+        FrameDecodeStream::next_frame(self)
+    }
+
+    fn is_alive(&mut self) -> opentake_media::Result<bool> {
+        FrameDecodeStream::is_alive(self)
+    }
+}
+
+#[derive(Default)]
+struct ExportFrameServer {
+    config: Option<FrameServerConfig>,
+    stream: Option<Box<dyn FrameServerStream>>,
+    next_frame: i64,
+    cache: VecDeque<(i64, Rc<RgbaFrame>)>,
+}
+
+impl ExportFrameServer {
+    fn frame(
+        &mut self,
+        config: FrameServerConfig,
+        requested_frame: i64,
+    ) -> opentake_media::Result<Rc<RgbaFrame>> {
+        self.frame_with(config, requested_frame, &mut |config, start_frame| {
+            FrameDecodeStream::spawn(&config.path, &config.request(start_frame))
+                .map(|stream| Box::new(stream) as Box<dyn FrameServerStream>)
+        })
+    }
+
+    fn frame_with<F>(
+        &mut self,
+        config: FrameServerConfig,
+        requested_frame: i64,
+        spawn: &mut F,
+    ) -> opentake_media::Result<Rc<RgbaFrame>>
+    where
+        F: FnMut(&FrameServerConfig, i64) -> opentake_media::Result<Box<dyn FrameServerStream>>,
+    {
+        let requested_frame = requested_frame.max(0);
+        if self.config.as_ref() != Some(&config) {
+            self.stream = None;
+            self.cache.clear();
+            self.config = Some(config);
+        }
+        // Pair interpolation may ask for the just-decoded predecessor.
+        if let Some((_, frame)) = self
+            .cache
+            .iter()
+            .find(|(frame, _)| *frame == requested_frame)
+        {
+            return Ok(frame.clone());
+        }
+
+        if self.stream.is_some() && requested_frame < self.next_frame {
+            self.stream = None;
+            self.cache.clear();
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            match stream.is_alive() {
+                Ok(true) => {}
+                Ok(false) => self.stream = None,
+                Err(error) => {
+                    self.stream = None;
+                    return Err(error);
+                }
+            }
+        }
+        if self.stream.is_none() {
+            self.next_frame = requested_frame;
+            let config = self
+                .config
+                .as_ref()
+                .expect("frame server config installed before spawn");
+            self.stream = Some(spawn(config, requested_frame)?);
+        }
+
+        while self.next_frame <= requested_frame {
+            let decoded = match self
+                .stream
+                .as_mut()
+                .expect("frame server stream installed before decode")
+                .next_frame()
+            {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.stream = None;
+                    return Err(error);
+                }
+            };
+            let decoded_index = self.next_frame;
+            self.next_frame += 1;
+            self.cache.push_back((decoded_index, Rc::new(decoded)));
+            while self.cache.len() > FRAME_SERVER_CACHE_CAP {
+                self.cache.pop_front();
+            }
+        }
+
+        self.cache
+            .back()
+            .map(|(_, frame)| frame.clone())
+            .ok_or_else(|| MediaError::Decode("frame server produced no frame".to_string()))
+    }
+}
+
 /// `TextureResolver` that decodes a layer's pixels on demand via ffmpeg and
 /// uploads them to the GPU. Video keys per source-frame; image and Lottie keys
 /// include source content hashes; text rasterizes its box. Mirrors the preview
@@ -488,10 +628,36 @@ struct MediaResolver<'d> {
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
+    frame_servers: &'d mut HashMap<String, ExportFrameServer>,
     materialization_error: Option<String>,
 }
 
 impl MediaResolver<'_> {
+    fn decode_video_frame(
+        &mut self,
+        media_ref: &str,
+        source_frame: i64,
+        source_fps: f64,
+    ) -> Option<Rc<RgbaFrame>> {
+        if !source_fps.is_finite() || source_fps <= 0.0 {
+            return None;
+        }
+        let path = self.media.get(media_ref)?.path.clone();
+        let config = FrameServerConfig::new(path.clone(), source_fps, self.render_box);
+        let request = config.request(source_frame);
+        match self
+            .frame_servers
+            .entry(media_ref.to_string())
+            .or_default()
+            .frame(config, source_frame)
+        {
+            Ok(frame) => Some(frame),
+            Err(_) => decode_frame_at(&path, &request)
+                .ok()
+                .map(|(_, frame)| Rc::new(frame)),
+        }
+    }
+
     fn resolve_text(&mut self, clip_id: &str) -> Option<Rc<GpuTexture>> {
         let key = format!("t:{clip_id}");
         if let Some(tex) = self.cache.get(&key) {
@@ -523,8 +689,11 @@ impl MediaResolver<'_> {
         if let Some(tex) = self.cache.get(&key) {
             return Some(tex);
         }
-        let info = self.media.get(media_ref)?;
-        let source_fps = info.source_fps.unwrap_or(interpolation.source_fps);
+        let source_fps = self
+            .media
+            .get(media_ref)?
+            .source_fps
+            .unwrap_or(interpolation.source_fps);
         if !source_fps.is_finite() || source_fps <= 0.0 {
             return None;
         }
@@ -533,27 +702,15 @@ impl MediaResolver<'_> {
         let first_index = source_position.floor().max(0.0) as i64;
         let next_index = source_position.ceil().max(0.0) as i64;
         let alpha = source_position - first_index as f64;
-        let decode = |index: i64| {
-            decode_frame_at(
-                &info.path,
-                &FrameRequest {
-                    time_secs: index as f64 / source_fps,
-                    max_size: self.render_box,
-                    tolerance_secs: 0.0,
-                    apply_rotation: true,
-                },
-            )
-            .ok()
-            .map(|(_, frame)| frame)
-        };
-        let first = decode(first_index)?;
+        let first = self.decode_video_frame(media_ref, first_index, source_fps)?;
         let last = if next_index == first_index {
             first.clone()
         } else {
             // A half-open media duration may not expose the mathematical next
             // frame at the tail. Hold the last decodable endpoint instead of
             // dropping the whole layer to black.
-            decode(next_index).unwrap_or_else(|| first.clone())
+            self.decode_video_frame(media_ref, next_index, source_fps)
+                .unwrap_or_else(|| first.clone())
         };
         let requested = match interpolation.mode {
             TextureInterpolationMode::Nearest => FrameInterpolationMode::Nearest,
@@ -619,23 +776,27 @@ impl TextureResolver for MediaResolver<'_> {
             return Some(tex);
         }
 
-        let time_secs = if is_image {
-            0.0
+        let frame = if is_image {
+            decode_frame_at(
+                &info.path,
+                &FrameRequest {
+                    time_secs: 0.0,
+                    max_size: self.render_box,
+                    tolerance_secs: 0.0,
+                    apply_rotation: true,
+                },
+            )
+            .ok()
+            .map(|(_, frame)| Rc::new(frame))?
         } else {
-            project_frame_time_secs(source_frame, self.timeline_fps)
+            let source_fps = if self.timeline_fps > 0 {
+                self.timeline_fps as f64
+            } else {
+                30.0
+            };
+            self.decode_video_frame(media_ref, source_frame, source_fps)?
         };
-
-        let req = FrameRequest {
-            time_secs,
-            max_size: self.render_box,
-            // Export advances frame-by-frame; a tight tolerance keeps each
-            // composited frame on the exact target time (quality over the
-            // scrub-oriented wide tolerance the preview uses).
-            tolerance_secs: 0.0,
-            apply_rotation: true,
-        };
-        let (_actual, frame) = decode_frame_at(&info.path, &req).ok()?;
-        let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba, false);
+        let decoded = DecodedFrame::new(frame.width, frame.height, frame.rgba.clone(), false);
         let tex = upload_rgba(self.device, self.queue, &decoded, false, Some("export-src"));
         Some(self.cache.insert(key, tex))
     }
@@ -1480,6 +1641,7 @@ pub(crate) fn run_export_with_control(
     let mut lut_cache = HashMap::new();
     let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
     let mut lottie = LottieMaterializer::new();
+    let mut frame_servers = HashMap::new();
     for f in start_frame..end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
@@ -1511,6 +1673,7 @@ pub(crate) fn run_export_with_control(
             render_box: (render_size.width, render_size.height),
             project_root: project_root.as_ref(),
             lut_cache: &mut lut_cache,
+            frame_servers: &mut frame_servers,
             materialization_error: None,
         };
         let interpolation = TextureInterpolationConfig::new(
@@ -1562,6 +1725,8 @@ pub(crate) fn run_export_with_control(
             }
         }
     }
+    // Drop blocked rawvideo children as soon as visual rendering ends.
+    frame_servers.clear();
 
     // Decode + linearly mix every audio-bearing clip in bounded windows, then
     // append each window to the encoder's private PCM spool. `finish` muxes that
@@ -2657,15 +2822,6 @@ pub fn run_bundle_export(
     Ok(BundleReportDto::from_report(out_path, report))
 }
 
-fn project_frame_time_secs(source_frame: i64, timeline_fps: i32) -> f64 {
-    let fps = if timeline_fps > 0 {
-        timeline_fps as f64
-    } else {
-        30.0
-    };
-    (source_frame.max(0) as f64) / fps
-}
-
 fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)> {
     if clip.duration_frames <= 0 || timeline_fps <= 0 {
         return None;
@@ -2682,8 +2838,63 @@ fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
     use std::path::Path;
+
+    struct FakeFrameStream {
+        next: i64,
+        reads: Rc<RefCell<Vec<i64>>>,
+    }
+
+    impl FrameServerStream for FakeFrameStream {
+        fn next_frame(&mut self) -> opentake_media::Result<RgbaFrame> {
+            let index = self.next;
+            self.next += 1;
+            self.reads.borrow_mut().push(index);
+            Ok(RgbaFrame::new(1, 1, vec![index as u8, 0, 0, 255]))
+        }
+
+        fn is_alive(&mut self) -> opentake_media::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn frame_server_skips_forward_caches_pairs_and_respawns_backward() {
+        let config = FrameServerConfig::new(PathBuf::from("/video.mp4"), 30.0, (1920, 1080));
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let spawns = Rc::new(RefCell::new(Vec::new()));
+        let mut spawn = {
+            let reads = reads.clone();
+            let spawns = spawns.clone();
+            move |_: &FrameServerConfig, start_frame: i64| {
+                spawns.borrow_mut().push(start_frame);
+                Ok(Box::new(FakeFrameStream {
+                    next: start_frame,
+                    reads: reads.clone(),
+                }) as Box<dyn FrameServerStream>)
+            }
+        };
+        let mut server = ExportFrameServer::default();
+
+        server
+            .frame_with(config.clone(), 10, &mut spawn)
+            .expect("spawn at first request");
+        server
+            .frame_with(config.clone(), 12, &mut spawn)
+            .expect("discard frame 11 and return frame 12");
+        let cached = server
+            .frame_with(config.clone(), 11, &mut spawn)
+            .expect("interpolation neighbor stays cached");
+        assert_eq!(cached.rgba[0], 11);
+        server
+            .frame_with(config, 9, &mut spawn)
+            .expect("uncached backward request respawns");
+
+        assert_eq!(*reads.borrow(), vec![10, 11, 12, 9]);
+        assert_eq!(*spawns.borrow(), vec![10, 9]);
+    }
 
     #[test]
     fn denoise_export_uses_shared_processing_owner() {

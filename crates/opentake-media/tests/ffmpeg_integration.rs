@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use opentake_media::decode::frame::FrameDecodeStream;
 use opentake_media::decode::spawn_video_stream;
 use opentake_media::ffmpeg_status::{ffmpeg_available, ffprobe_available};
 use opentake_media::{
@@ -109,6 +110,33 @@ fn decode_frame_returns_rgba_of_expected_size() {
     assert_eq!(frame.width, 320);
     assert_eq!(frame.height, 240);
     assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+}
+
+#[test]
+fn frame_decode_stream_yields_consecutive_scaled_frames() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let av = dir.path().join("av.mp4");
+    if !make_av(&av) {
+        return;
+    }
+    let request = FrameRequest {
+        time_secs: 0.5,
+        max_size: (120, 68),
+        tolerance_secs: 0.0,
+        apply_rotation: true,
+    };
+    let expected = decode_frame_at(&av, &request).unwrap().1;
+    let mut stream = FrameDecodeStream::spawn(&av, &request).unwrap();
+    let first = stream.next_frame().unwrap();
+    let next = stream.next_frame().unwrap();
+
+    assert_eq!(first, expected);
+    assert_eq!((first.width, first.height), (next.width, next.height));
+    assert!(first.width <= 120 && first.height <= 68);
+    assert_ne!(first.rgba, next.rgba);
 }
 
 #[test]
