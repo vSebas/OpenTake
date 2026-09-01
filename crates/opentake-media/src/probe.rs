@@ -25,6 +25,10 @@ pub struct MediaProbe {
     /// `avg_frame_rate` (falling back to `r_frame_rate`), matching
     /// `nominalFrameRate` semantics.
     pub fps: Option<f64>,
+    /// Raw ffprobe rates retained separately so callers can require positive
+    /// evidence of constant-rate media.
+    pub avg_frame_rate: Option<f64>,
+    pub r_frame_rate: Option<f64>,
     pub has_audio: bool,
     pub has_video: bool,
     /// ffprobe `codec_name` of the primary (non-cover-art) video stream.
@@ -39,6 +43,15 @@ pub struct MediaProbe {
     /// Source video color signalling retained for HDR-aware decode and durable
     /// project metadata. Absent only when the stream reports no color fields.
     pub color: Option<MediaColorMetadata>,
+}
+
+impl MediaProbe {
+    pub fn is_constant_frame_rate(&self) -> bool {
+        matches!(
+            (self.avg_frame_rate, self.r_frame_rate),
+            (Some(avg), Some(real)) if avg == real
+        )
+    }
 }
 
 /// Open the container and read the first video stream + audio presence.
@@ -153,6 +166,8 @@ pub fn parse_probe(json: &serde_json::Value) -> MediaProbe {
     let mut width = None;
     let mut height = None;
     let mut fps = None;
+    let mut avg_frame_rate = None;
+    let mut r_frame_rate = None;
     let mut video_duration = None;
     let mut color = None;
     let mut video_codec = None;
@@ -173,15 +188,15 @@ pub fn parse_probe(json: &serde_json::Value) -> MediaProbe {
             height = h;
         }
 
-        fps = v
+        avg_frame_rate = v
             .get("avg_frame_rate")
             .and_then(|x| x.as_str())
-            .and_then(parse_rate)
-            .or_else(|| {
-                v.get("r_frame_rate")
-                    .and_then(|x| x.as_str())
-                    .and_then(parse_rate)
-            });
+            .and_then(parse_rate);
+        r_frame_rate = v
+            .get("r_frame_rate")
+            .and_then(|x| x.as_str())
+            .and_then(parse_rate);
+        fps = avg_frame_rate.or(r_frame_rate);
 
         video_duration = v
             .get("duration")
@@ -229,6 +244,8 @@ pub fn parse_probe(json: &serde_json::Value) -> MediaProbe {
         width,
         height,
         fps,
+        avg_frame_rate,
+        r_frame_rate,
         has_audio,
         has_video,
         video_codec,
@@ -407,6 +424,36 @@ mod tests {
             "format": {}
         });
         assert_eq!(parse_probe(&j).fps, Some(25.0));
+    }
+
+    #[test]
+    fn constant_frame_rate_requires_both_matching_rates() {
+        let matching = parse_probe(&json!({
+            "streams": [{
+                "codec_type": "video", "width": 100, "height": 100,
+                "avg_frame_rate": "30000/1001", "r_frame_rate": "30000/1001"
+            }],
+            "format": {}
+        }));
+        assert!(matching.is_constant_frame_rate());
+
+        let different = parse_probe(&json!({
+            "streams": [{
+                "codec_type": "video", "width": 100, "height": 100,
+                "avg_frame_rate": "24/1", "r_frame_rate": "30/1"
+            }],
+            "format": {}
+        }));
+        assert!(!different.is_constant_frame_rate());
+
+        let missing = parse_probe(&json!({
+            "streams": [{
+                "codec_type": "video", "width": 100, "height": 100,
+                "avg_frame_rate": "30/1"
+            }],
+            "format": {}
+        }));
+        assert!(!missing.is_constant_frame_rate());
     }
 
     #[test]

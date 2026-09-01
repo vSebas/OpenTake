@@ -51,7 +51,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::render::LottieMaterializer;
 
 use opentake_core::AppCore;
-use opentake_domain::{AudioDenoise, Clip, ClipType, LutReference, MediaSource, TextStyle};
+use opentake_domain::{
+    AudioDenoise, Clip, ClipType, LutReference, MediaColorMetadata, MediaSource, TextStyle,
+};
 use opentake_media::decode::frame::FrameDecodeStream;
 #[cfg(test)]
 use opentake_media::encode::ClipAudio;
@@ -79,6 +81,7 @@ use opentake_render::{
 /// frames. Bounds VRAM during the export loop.
 const TEXTURE_CACHE_CAP: usize = 64;
 const FRAME_SERVER_CACHE_CAP: usize = 2;
+const FRAME_SERVER_POOL_CAP: usize = 4;
 const AUDIO_STREAM_WINDOW_SAMPLES: usize = MIX_SAMPLE_RATE as usize * 2;
 
 /// Requested output codec, projected from the front-end.
@@ -449,6 +452,21 @@ struct MediaInfo {
     source_fps: Option<f64>,
 }
 
+#[derive(Clone, Default)]
+struct FrameServerMediaMetadata {
+    color: Option<MediaColorMetadata>,
+    is_constant_frame_rate: bool,
+}
+
+impl From<opentake_media::MediaProbe> for FrameServerMediaMetadata {
+    fn from(probe: opentake_media::MediaProbe) -> Self {
+        FrameServerMediaMetadata {
+            is_constant_frame_rate: probe.is_constant_frame_rate(),
+            color: probe.color,
+        }
+    }
+}
+
 /// A text clip projected from the timeline, keyed by clip id.
 struct TextInfo {
     content: String,
@@ -473,7 +491,7 @@ impl SourceMetrics for ManifestMetrics {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FrameServerConfig {
     path: PathBuf,
     source_fps_bits: u64,
@@ -525,17 +543,6 @@ struct ExportFrameServer {
 }
 
 impl ExportFrameServer {
-    fn frame(
-        &mut self,
-        config: FrameServerConfig,
-        requested_frame: i64,
-    ) -> opentake_media::Result<Rc<RgbaFrame>> {
-        self.frame_with(config, requested_frame, &mut |config, start_frame| {
-            FrameDecodeStream::spawn(&config.path, &config.request(start_frame))
-                .map(|stream| Box::new(stream) as Box<dyn FrameServerStream>)
-        })
-    }
-
     fn frame_with<F>(
         &mut self,
         config: FrameServerConfig,
@@ -567,7 +574,10 @@ impl ExportFrameServer {
         if let Some(stream) = self.stream.as_mut() {
             match stream.is_alive() {
                 Ok(true) => {}
-                Ok(false) => self.stream = None,
+                Ok(false) => {
+                    self.stream = None;
+                    return Err(MediaError::Decode("frame stream exited".to_string()));
+                }
                 Err(error) => {
                     self.stream = None;
                     return Err(error);
@@ -611,6 +621,142 @@ impl ExportFrameServer {
     }
 }
 
+struct ExportFrameServerPool {
+    capacity: usize,
+    servers: HashMap<String, ExportFrameServer>,
+    recency: VecDeque<String>,
+    failed_configs: HashSet<(String, FrameServerConfig)>,
+}
+
+impl Default for ExportFrameServerPool {
+    fn default() -> Self {
+        ExportFrameServerPool {
+            capacity: FRAME_SERVER_POOL_CAP,
+            servers: HashMap::new(),
+            recency: VecDeque::new(),
+            failed_configs: HashSet::new(),
+        }
+    }
+}
+
+impl ExportFrameServerPool {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        ExportFrameServerPool {
+            capacity,
+            ..ExportFrameServerPool::default()
+        }
+    }
+
+    fn server_mut(&mut self, media_ref: &str) -> &mut ExportFrameServer {
+        if let Some(position) = self.recency.iter().position(|key| key == media_ref) {
+            self.recency.remove(position);
+        } else if self.servers.len() >= self.capacity {
+            if let Some(evicted) = self.recency.pop_front() {
+                self.servers.remove(&evicted);
+            }
+        }
+        self.recency.push_back(media_ref.to_string());
+        self.servers.entry(media_ref.to_string()).or_default()
+    }
+
+    fn frame(
+        &mut self,
+        media_ref: &str,
+        config: FrameServerConfig,
+        requested_frame: i64,
+        color: Option<&MediaColorMetadata>,
+    ) -> opentake_media::Result<Option<Rc<RgbaFrame>>> {
+        self.frame_with(
+            media_ref,
+            config,
+            requested_frame,
+            &mut |config, start_frame| {
+                FrameDecodeStream::spawn_with_color(
+                    &config.path,
+                    &config.request(start_frame),
+                    color,
+                )
+                .map(|stream| Box::new(stream) as Box<dyn FrameServerStream>)
+            },
+        )
+    }
+
+    fn frame_with<F>(
+        &mut self,
+        media_ref: &str,
+        config: FrameServerConfig,
+        requested_frame: i64,
+        spawn: &mut F,
+    ) -> opentake_media::Result<Option<Rc<RgbaFrame>>>
+    where
+        F: FnMut(&FrameServerConfig, i64) -> opentake_media::Result<Box<dyn FrameServerStream>>,
+    {
+        let failure_key = (media_ref.to_string(), config.clone());
+        if self.failed_configs.contains(&failure_key) {
+            return Ok(None);
+        }
+        let result = self
+            .server_mut(media_ref)
+            .frame_with(config.clone(), requested_frame, spawn);
+        match result {
+            Ok(frame) => Ok(Some(frame)),
+            Err(error) => {
+                if self.failed_configs.insert(failure_key) {
+                    tracing::warn!(
+                        media_ref,
+                        path = %config.path.display(),
+                        error = %error,
+                        "frame stream disabled for the remainder of this export"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.servers.clear();
+        self.recency.clear();
+    }
+}
+
+fn decode_export_video_frame(
+    frame_servers: &mut ExportFrameServerPool,
+    metadata_cache: &mut HashMap<String, FrameServerMediaMetadata>,
+    media_ref: &str,
+    path: &Path,
+    source_frame: i64,
+    source_fps: f64,
+    render_box: (u32, u32),
+) -> Option<Rc<RgbaFrame>> {
+    if !source_fps.is_finite() || source_fps <= 0.0 {
+        return None;
+    }
+    let config = FrameServerConfig::new(path.to_path_buf(), source_fps, render_box);
+    let request = config.request(source_frame);
+    let metadata = match metadata_cache.get(media_ref) {
+        Some(metadata) => metadata.clone(),
+        None => {
+            let metadata = probe(path)
+                .map(FrameServerMediaMetadata::from)
+                .unwrap_or_default();
+            metadata_cache.insert(media_ref.to_string(), metadata.clone());
+            metadata
+        }
+    };
+    if metadata.is_constant_frame_rate {
+        if let Ok(Some(frame)) =
+            frame_servers.frame(media_ref, config, source_frame, metadata.color.as_ref())
+        {
+            return Some(frame);
+        }
+    }
+    decode_frame_at(path, &request)
+        .ok()
+        .map(|(_, frame)| Rc::new(frame))
+}
+
 /// `TextureResolver` that decodes a layer's pixels on demand via ffmpeg and
 /// uploads them to the GPU. Video keys per source-frame; image and Lottie keys
 /// include source content hashes; text rasterizes its box. Mirrors the preview
@@ -628,7 +774,8 @@ struct MediaResolver<'d> {
     render_box: (u32, u32),
     project_root: Option<&'d ProjectRoot>,
     lut_cache: &'d mut HashMap<String, Rc<GpuLutTexture>>,
-    frame_servers: &'d mut HashMap<String, ExportFrameServer>,
+    frame_servers: &'d mut ExportFrameServerPool,
+    frame_server_metadata: &'d mut HashMap<String, FrameServerMediaMetadata>,
     materialization_error: Option<String>,
 }
 
@@ -639,23 +786,16 @@ impl MediaResolver<'_> {
         source_frame: i64,
         source_fps: f64,
     ) -> Option<Rc<RgbaFrame>> {
-        if !source_fps.is_finite() || source_fps <= 0.0 {
-            return None;
-        }
         let path = self.media.get(media_ref)?.path.clone();
-        let config = FrameServerConfig::new(path.clone(), source_fps, self.render_box);
-        let request = config.request(source_frame);
-        match self
-            .frame_servers
-            .entry(media_ref.to_string())
-            .or_default()
-            .frame(config, source_frame)
-        {
-            Ok(frame) => Some(frame),
-            Err(_) => decode_frame_at(&path, &request)
-                .ok()
-                .map(|(_, frame)| Rc::new(frame)),
-        }
+        decode_export_video_frame(
+            self.frame_servers,
+            self.frame_server_metadata,
+            media_ref,
+            &path,
+            source_frame,
+            source_fps,
+            self.render_box,
+        )
     }
 
     fn resolve_text(&mut self, clip_id: &str) -> Option<Rc<GpuTexture>> {
@@ -1641,7 +1781,8 @@ pub(crate) fn run_export_with_control(
     let mut lut_cache = HashMap::new();
     let mut texture_cache = TextureCache::new(TEXTURE_CACHE_CAP);
     let mut lottie = LottieMaterializer::new();
-    let mut frame_servers = HashMap::new();
+    let mut frame_servers = ExportFrameServerPool::default();
+    let mut frame_server_metadata = HashMap::new();
     for f in start_frame..end_frame {
         if control.is_some_and(|c| c.is_cancelled())
             || external_cancel
@@ -1674,6 +1815,7 @@ pub(crate) fn run_export_with_control(
             project_root: project_root.as_ref(),
             lut_cache: &mut lut_cache,
             frame_servers: &mut frame_servers,
+            frame_server_metadata: &mut frame_server_metadata,
             materialization_error: None,
         };
         let interpolation = TextureInterpolationConfig::new(
@@ -2838,9 +2980,10 @@ fn clip_source_window_secs(clip: &Clip, timeline_fps: i32) -> Option<(f64, f64)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
     struct FakeFrameStream {
         next: i64,
@@ -2853,6 +2996,39 @@ mod tests {
             self.next += 1;
             self.reads.borrow_mut().push(index);
             Ok(RgbaFrame::new(1, 1, vec![index as u8, 0, 0, 255]))
+        }
+
+        fn is_alive(&mut self) -> opentake_media::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct DroppingFrameStream {
+        id: String,
+        drops: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl FrameServerStream for DroppingFrameStream {
+        fn next_frame(&mut self) -> opentake_media::Result<RgbaFrame> {
+            Ok(RgbaFrame::new(1, 1, vec![0, 0, 0, 255]))
+        }
+
+        fn is_alive(&mut self) -> opentake_media::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    impl Drop for DroppingFrameStream {
+        fn drop(&mut self) {
+            self.drops.borrow_mut().push(self.id.clone());
+        }
+    }
+
+    struct FailingFrameStream;
+
+    impl FrameServerStream for FailingFrameStream {
+        fn next_frame(&mut self) -> opentake_media::Result<RgbaFrame> {
+            Err(MediaError::Decode("injected stream failure".to_string()))
         }
 
         fn is_alive(&mut self) -> opentake_media::Result<bool> {
@@ -2894,6 +3070,120 @@ mod tests {
 
         assert_eq!(*reads.borrow(), vec![10, 11, 12, 9]);
         assert_eq!(*spawns.borrow(), vec![10, 9]);
+    }
+
+    #[test]
+    fn frame_server_pool_evicts_least_recently_used_stream() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let mut spawn = {
+            let drops = drops.clone();
+            move |config: &FrameServerConfig, _start_frame: i64| {
+                Ok(Box::new(DroppingFrameStream {
+                    id: config.path.to_string_lossy().into_owned(),
+                    drops: drops.clone(),
+                }) as Box<dyn FrameServerStream>)
+            }
+        };
+        let mut pool = ExportFrameServerPool::with_capacity(2);
+        let a = FrameServerConfig::new(PathBuf::from("a.mp4"), 30.0, (64, 64));
+        let b = FrameServerConfig::new(PathBuf::from("b.mp4"), 30.0, (64, 64));
+        let c = FrameServerConfig::new(PathBuf::from("c.mp4"), 30.0, (64, 64));
+
+        pool.frame_with("a", a.clone(), 0, &mut spawn).unwrap();
+        pool.frame_with("b", b, 0, &mut spawn).unwrap();
+        pool.frame_with("a", a, 0, &mut spawn).unwrap();
+        pool.frame_with("c", c, 0, &mut spawn).unwrap();
+
+        assert!(pool.servers.contains_key("a"));
+        assert!(pool.servers.contains_key("c"));
+        assert!(!pool.servers.contains_key("b"));
+        assert_eq!(*drops.borrow(), vec!["b.mp4".to_string()]);
+    }
+
+    #[test]
+    fn frame_server_failure_trips_circuit_for_export() {
+        let spawns = Rc::new(Cell::new(0));
+        let mut spawn = {
+            let spawns = spawns.clone();
+            move |_: &FrameServerConfig, _: i64| {
+                spawns.set(spawns.get() + 1);
+                Ok(Box::new(FailingFrameStream) as Box<dyn FrameServerStream>)
+            }
+        };
+        let config = FrameServerConfig::new(PathBuf::from("bad.mp4"), 30.0, (64, 64));
+        let mut pool = ExportFrameServerPool::default();
+
+        assert!(pool
+            .frame_with("bad", config.clone(), 0, &mut spawn)
+            .is_err());
+        assert!(pool
+            .frame_with("bad", config, 1, &mut spawn)
+            .unwrap()
+            .is_none());
+        assert_eq!(spawns.get(), 1);
+    }
+
+    #[test]
+    fn vfr_export_gate_matches_independent_decode_across_rate_change() {
+        if !opentake_media::ffmpeg_status::ffmpeg_available()
+            || !opentake_media::ffmpeg_status::ffprobe_available()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("vfr.mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=4:size=160x90:rate=30",
+                "-vf",
+                "select='if(lt(t,2),not(mod(n,2)),1)'",
+                "-fps_mode",
+                "vfr",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !generated {
+            return;
+        }
+        let metadata = probe(&source).unwrap();
+        assert!(!metadata.is_constant_frame_rate());
+        let fps = metadata.fps.unwrap();
+        let mut pool = ExportFrameServerPool::default();
+        let mut metadata_cache = HashMap::new();
+
+        for source_frame in (0..80).step_by(4) {
+            let request = FrameRequest {
+                time_secs: source_frame as f64 / fps,
+                max_size: (80, 46),
+                tolerance_secs: 0.0,
+                apply_rotation: true,
+            };
+            let expected = decode_frame_at(&source, &request).unwrap().1;
+            let actual = decode_export_video_frame(
+                &mut pool,
+                &mut metadata_cache,
+                "vfr",
+                &source,
+                source_frame,
+                fps,
+                request.max_size,
+            )
+            .unwrap();
+            assert_eq!(*actual, expected, "source frame {source_frame}");
+        }
+        assert!(pool.servers.is_empty());
     }
 
     #[test]

@@ -35,6 +35,12 @@ fn make_av(path: &Path) -> bool {
             "sine=frequency=440:duration=2",
             "-c:v",
             "libx264",
+            "-g",
+            "20",
+            "-keyint_min",
+            "20",
+            "-sc_threshold",
+            "0",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -113,8 +119,8 @@ fn decode_frame_returns_rgba_of_expected_size() {
 }
 
 #[test]
-fn frame_decode_stream_yields_consecutive_scaled_frames() {
-    if !ffmpeg_available() {
+fn cfr_frame_decode_stream_matches_independent_decode_from_non_keyframe() {
+    if !ffmpeg_available() || !ffprobe_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -122,21 +128,33 @@ fn frame_decode_stream_yields_consecutive_scaled_frames() {
     if !make_av(&av) {
         return;
     }
+    let metadata = probe(&av).unwrap();
+    assert!(metadata.is_constant_frame_rate());
+    let fps = metadata.fps.unwrap();
+    let start_frame = 3_i64;
     let request = FrameRequest {
-        time_secs: 0.5,
+        time_secs: start_frame as f64 / fps,
         max_size: (120, 68),
         tolerance_secs: 0.0,
         apply_rotation: true,
     };
-    let expected = decode_frame_at(&av, &request).unwrap().1;
-    let mut stream = FrameDecodeStream::spawn(&av, &request).unwrap();
-    let first = stream.next_frame().unwrap();
-    let next = stream.next_frame().unwrap();
+    let mut stream =
+        FrameDecodeStream::spawn_with_color(&av, &request, metadata.color.as_ref()).unwrap();
 
-    assert_eq!(first, expected);
-    assert_eq!((first.width, first.height), (next.width, next.height));
-    assert!(first.width <= 120 && first.height <= 68);
-    assert_ne!(first.rgba, next.rgba);
+    for offset in 0..10 {
+        let expected = decode_frame_at(
+            &av,
+            &FrameRequest {
+                time_secs: (start_frame + offset) as f64 / fps,
+                ..request.clone()
+            },
+        )
+        .unwrap()
+        .1;
+        let streamed = stream.next_frame().unwrap();
+        assert_eq!(streamed, expected, "frame offset {offset}");
+        assert!(streamed.width <= 120 && streamed.height <= 68);
+    }
 }
 
 #[test]

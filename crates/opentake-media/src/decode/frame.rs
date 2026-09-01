@@ -478,8 +478,16 @@ impl FrameDecodeStream {
             .filter(|metadata| metadata.is_file())
             .and_then(|_| crate::probe::probe(path).ok())
             .and_then(|probe| probe.color);
+        Self::spawn_with_color(path, req, color.as_ref())
+    }
+
+    pub fn spawn_with_color(
+        path: &Path,
+        req: &FrameRequest,
+        color: Option<&opentake_domain::MediaColorMetadata>,
+    ) -> Result<Self> {
         let mut child = ff::ffmpeg()
-            .args(frame_stream_args_with_color(path, req, color.as_ref()))
+            .args(frame_stream_args_with_color(path, req, color))
             .spawn()
             .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
         let iter = match child.iter() {
