@@ -87,6 +87,12 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::DeleteFolder => "Deletes folders and everything inside them (subfolders and assets). Clips referencing any deleted asset are removed from the timeline in the same undoable action.",
 
+        ToolName::ListProjects => "Project bundles in the projects folder (the folder the OPEN project lives in). Returns { projects: [{name, open}] }. Requires a saved project to be open so the folder is known. Names here are what open_project accepts.",
+
+        ToolName::OpenProject => "Open a saved project bundle by name (from list_projects), REPLACING the timeline the GUI currently shows. Unsaved changes in the current project are lost — call save_project first if they matter. Returns the opened project's identity (projectEpoch, timelineVersion); previously fetched clipIds belong to the old project and are invalid afterwards.",
+
+        ToolName::SaveProject => "Save the open project back to its bundle on disk (what the GUI's save does). Returns { savedTo }. Fails when the project has never been saved (no bundle to save into).",
+
         ToolName::ListModels => "Lists AI models with their capabilities (durations, aspect ratios, resolutions, first/last frame support, reference support, voices/category for audio, upscaler speed). Always call before generate_video, generate_image, generate_audio, or upscale_media so the model you pick actually supports the constraints you need. Returns { models, loaded } — if loaded=false the catalog hasn't synced yet (e.g. user not signed in); the models array may be empty even when models exist, so do not conclude no models are available. Retry after the user signs in.",
 
         // --- OpenTake workflow-plugin tools (agent-SPEC §7.4; OpenTake-authored, styled to match upstream) ---
@@ -621,6 +627,17 @@ pub fn input_schema(tool: ToolName) -> Value {
             }),
             &[],
         ),
+
+        ToolName::ListProjects => object(json!({}), &[]),
+
+        ToolName::OpenProject => object(
+            json!({
+                "name": {"type": "string", "description": "Bundle name exactly as returned by list_projects (no paths)."}
+            }),
+            &["name"],
+        ),
+
+        ToolName::SaveProject => object(json!({}), &[]),
 
         ToolName::ActivateWorkflow => object(
             json!({

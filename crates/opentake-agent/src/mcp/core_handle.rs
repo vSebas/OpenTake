@@ -88,6 +88,32 @@ pub trait CoreHandle: Send + Sync {
     /// The open project's bundle directory, or `None` for an unsaved project.
     fn project_dir(&self) -> Option<PathBuf>;
 
+    /// Whether this handle can list/open/save project bundles. Hosts that
+    /// return `true` get the project-lifecycle tools advertised.
+    fn supports_project_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// The directory project bundles live in, derived from the OPEN bundle's
+    /// parent — the same folder the GUI saves into. `None` while no saved
+    /// project is open (the external live-project gate requires one for
+    /// mutations anyway, so lifecycle tools share that precondition).
+    fn projects_root(&self) -> Option<PathBuf> {
+        self.project_dir()
+            .and_then(|dir| dir.parent().map(std::path::Path::to_path_buf))
+    }
+
+    /// Open the bundle at `path`, replacing the timeline the GUI shows.
+    /// Returns `(project_epoch, timeline_version)` of the opened project.
+    fn open_project_bundle(&self, _path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+        anyhow::bail!("this host does not support opening projects over MCP")
+    }
+
+    /// Save the open project back to its bundle. Returns the written path.
+    fn save_open_project(&self) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("this host does not support saving projects over MCP")
+    }
+
     /// Resolve an asset id to the local file path that media analysis can read.
     /// The default implementation mirrors `MediaResolver.expected_path`.
     fn media_path(&self, media_ref: &str) -> Option<PathBuf> {
@@ -202,6 +228,24 @@ impl CoreHandle for AppCoreHandle {
 
     fn project_dir(&self) -> Option<PathBuf> {
         self.0.project_dir()
+    }
+
+    fn supports_project_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn open_project_bundle(&self, path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+        let snapshot = self
+            .0
+            .open_project(path)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok((snapshot.project_epoch, snapshot.version))
+    }
+
+    fn save_open_project(&self) -> anyhow::Result<PathBuf> {
+        self.0
+            .save_project(None)
+            .map_err(|error| anyhow::anyhow!("{error}"))
     }
 
     fn media_path(&self, media_ref: &str) -> Option<PathBuf> {

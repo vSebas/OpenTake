@@ -47,6 +47,14 @@ impl ToolArgs for GetTimelineArgs {
     const ALLOWED_KEYS: &'static [&'static str] = &["startFrame", "endFrame"];
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct OpenProjectArgs {
+    pub name: String,
+}
+impl ToolArgs for OpenProjectArgs {
+    const ALLOWED_KEYS: &'static [&'static str] = &["name"];
+}
+
 // --- add_clips ---
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

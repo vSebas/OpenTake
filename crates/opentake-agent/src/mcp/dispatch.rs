@@ -156,6 +156,7 @@ pub(crate) fn dispatch_admission_class(name: &str, args: &Value) -> DispatchAdmi
         | ToolName::SearchMedia
         | ToolName::ListModels
         | ToolName::ListFolders
+        | ToolName::ListProjects
         | ToolName::ListWorkflows
         | ToolName::DetectBeats
         | ToolName::SmartReframe
@@ -210,6 +211,8 @@ pub(crate) fn dispatch_admission_class(name: &str, args: &Value) -> DispatchAdmi
         | ToolName::TranslateCaptions
         | ToolName::ScriptToVideo
         | ToolName::GenerateAvatar
+        | ToolName::OpenProject
+        | ToolName::SaveProject
         | ToolName::CloneVoice => DispatchAdmissionClass::Mutation,
     }
 }
@@ -399,6 +402,9 @@ impl Dispatcher {
         }
         if self.can_do_vision_analysis() {
             tools.extend(ToolName::VISION);
+        }
+        if self.handle.supports_project_lifecycle() {
+            tools.extend(ToolName::PROJECT_LIFECYCLE);
         }
         tools
     }
@@ -697,6 +703,93 @@ impl Dispatcher {
                 Ok(ToolResult::ok(json.to_string()))
             }
             ToolName::ListModels => self.list_models_catalog(args),
+            ToolName::ListProjects => {
+                let root = self.handle.projects_root().ok_or_else(|| {
+                    ToolError::new(
+                        "list_projects: no saved project is open, so the \
+                         projects folder is unknown — open or save a project \
+                         in OpenTake first",
+                    )
+                })?;
+                let open_bundle = self.handle.project_dir();
+                let mut names: Vec<serde_json::Value> = Vec::new();
+                let entries = std::fs::read_dir(&root)
+                    .map_err(|e| ToolError::new(format!("list_projects: {e}")))?;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let is_bundle = path.is_dir()
+                        && path.extension().is_some_and(|ext| ext == "opentake");
+                    if !is_bundle {
+                        continue;
+                    }
+                    let name = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    names.push(serde_json::json!({
+                        "name": name,
+                        "open": Some(&path) == open_bundle.as_ref(),
+                    }));
+                }
+                names.sort_by_key(|item| {
+                    item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_owned()
+                });
+                Ok(ToolResult::ok(
+                    serde_json::json!({ "projects": names }).to_string(),
+                ))
+            }
+            ToolName::OpenProject => {
+                let a: OpenProjectArgs = decode_tool_args(args, "")?;
+                let name = a.name.trim();
+                if name.is_empty()
+                    || name.contains('/')
+                    || name.contains('\\')
+                    || name.contains("..")
+                {
+                    return Err(ToolError::new(
+                        "open_project: name must be a plain bundle name from \
+                         list_projects (no paths)",
+                    ));
+                }
+                let root = self.handle.projects_root().ok_or_else(|| {
+                    ToolError::new(
+                        "open_project: no saved project is open, so the \
+                         projects folder is unknown — open one in OpenTake first",
+                    )
+                })?;
+                let bundle = if name.ends_with(".opentake") {
+                    root.join(name)
+                } else {
+                    root.join(format!("{name}.opentake"))
+                };
+                if !bundle.is_dir() {
+                    return Err(ToolError::new(format!(
+                        "open_project: no bundle named {name:?} in {}",
+                        root.display()
+                    )));
+                }
+                let (project_epoch, timeline_version) = self
+                    .handle
+                    .open_project_bundle(&bundle)
+                    .map_err(|e| ToolError::new(format!("open_project: {e}")))?;
+                Ok(ToolResult::ok(
+                    serde_json::json!({
+                        "name": name.trim_end_matches(".opentake"),
+                        "projectEpoch": project_epoch,
+                        "timelineVersion": timeline_version,
+                    })
+                    .to_string(),
+                ))
+            }
+            ToolName::SaveProject => {
+                let saved = self
+                    .handle
+                    .save_open_project()
+                    .map_err(|e| ToolError::new(format!("save_project: {e}")))?;
+                Ok(ToolResult::ok(
+                    serde_json::json!({ "savedTo": saved.to_string_lossy() }).to_string(),
+                ))
+            }
             ToolName::InspectMedia => self.inspect_media(args, before, manifest),
 
             // --- Editing (wired to EditCommand) ---
@@ -2993,12 +3086,15 @@ fn validate_tool_args(tool: ToolName, args: &Value) -> Result<(), ToolError> {
         | ToolName::ListFolders
         | ToolName::Undo
         | ToolName::ListWorkflows
+        | ToolName::ListProjects
+        | ToolName::SaveProject
         | ToolName::DeactivateWorkflow => decode!(EmptyArgs),
         ToolName::InspectMedia => decode!(InspectMediaArgs),
         ToolName::GetTranscript => decode!(GetTranscriptArgs),
         ToolName::InspectTimeline => decode!(InspectTimelineArgs),
         ToolName::SearchMedia => decode!(SearchMediaArgs),
         ToolName::ListModels => decode!(ListModelsArgs),
+        ToolName::OpenProject => decode!(OpenProjectArgs),
         ToolName::AddClips => {
             decode!(AddClipsArgs);
             validate_array::<AddClipEntry>(args, "entries")?;
@@ -4750,6 +4846,85 @@ mod tests {
 
     fn dispatcher_with(handle: Arc<dyn CoreHandle>) -> Dispatcher {
         Dispatcher::new(handle, Arc::new(RwLock::new(PluginRegistry::new())))
+    }
+
+    /// TestHandle with project lifecycle over a temp projects folder.
+    struct LifecycleHandle {
+        inner: TestHandle,
+        root: PathBuf,
+        open_bundle: std::sync::Mutex<PathBuf>,
+        saved: AtomicUsize,
+    }
+
+    impl CoreHandle for LifecycleHandle {
+        fn timeline(&self) -> Timeline {
+            self.inner.timeline()
+        }
+        fn media(&self) -> MediaManifest {
+            self.inner.media()
+        }
+        fn apply(&self, cmd: EditCommand) -> anyhow::Result<EditResult> {
+            self.inner.apply(cmd)
+        }
+        fn project_dir(&self) -> Option<PathBuf> {
+            Some(self.open_bundle.lock().unwrap().clone())
+        }
+        fn supports_project_lifecycle(&self) -> bool {
+            true
+        }
+        fn open_project_bundle(&self, path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+            *self.open_bundle.lock().unwrap() = path.to_path_buf();
+            Ok((2, 7))
+        }
+        fn save_open_project(&self) -> anyhow::Result<PathBuf> {
+            self.saved.fetch_add(1, Ordering::SeqCst);
+            Ok(self.open_bundle.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn project_lifecycle_tools_list_open_save_and_reject_paths() {
+        let root = tempfile::tempdir().expect("projects root");
+        std::fs::create_dir(root.path().join("alpha.opentake")).unwrap();
+        std::fs::create_dir(root.path().join("beta.opentake")).unwrap();
+        std::fs::create_dir(root.path().join("not-a-bundle")).unwrap();
+        let handle = Arc::new(LifecycleHandle {
+            inner: TestHandle::new(),
+            root: root.path().to_path_buf(),
+            open_bundle: std::sync::Mutex::new(root.path().join("alpha.opentake")),
+            saved: AtomicUsize::new(0),
+        });
+        let d = dispatcher_with(handle.clone());
+        assert!(d.advertised_tools().contains(&ToolName::OpenProject));
+
+        let listed = d.dispatch("list_projects", serde_json::json!({}));
+        let text = listed.text_joined();
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("beta"), "{text}");
+        assert!(!text.contains("not-a-bundle"), "{text}");
+
+        let opened = d.dispatch("open_project", serde_json::json!({"name": "beta"}));
+        let text = opened.text_joined();
+        assert!(text.contains("\"projectEpoch\":2"), "{text}");
+        assert_eq!(
+            *handle.open_bundle.lock().unwrap(),
+            handle.root.join("beta.opentake"),
+        );
+
+        let escape = d.dispatch("open_project", serde_json::json!({"name": "../evil"}));
+        assert!(escape.is_error, "path traversal must be refused");
+
+        let saved = d.dispatch("save_project", serde_json::json!({}));
+        assert!(saved.text_joined().contains("savedTo"), "{}", saved.text_joined());
+        assert_eq!(handle.saved.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lifecycle_tools_hidden_without_host_support() {
+        let d = dispatcher_with(Arc::new(TestHandle::new()));
+        assert!(!d.advertised_tools().contains(&ToolName::OpenProject));
+        let refused = d.dispatch("open_project", serde_json::json!({"name": "x"}));
+        assert!(refused.is_error);
     }
 
     struct DeferredDocumentBridge {

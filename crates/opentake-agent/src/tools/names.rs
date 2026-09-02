@@ -17,6 +17,9 @@ pub enum ToolName {
     InspectTimeline,
     SearchMedia,
     ListModels,
+    ListProjects,
+    OpenProject,
+    SaveProject,
     // --- Timeline editing (11) ---
     AddClips,
     InsertClips,
@@ -118,6 +121,9 @@ impl ToolName {
             ToolName::InspectTimeline => "inspect_timeline",
             ToolName::SearchMedia => "search_media",
             ToolName::ListModels => "list_models",
+            ToolName::ListProjects => "list_projects",
+            ToolName::OpenProject => "open_project",
+            ToolName::SaveProject => "save_project",
             ToolName::AddClips => "add_clips",
             ToolName::InsertClips => "insert_clips",
             ToolName::RemoveClips => "remove_clips",
@@ -249,6 +255,12 @@ impl ToolName {
     /// in all other hosts.
     pub const VISION: [ToolName; 1] = [ToolName::SmartReframe];
 
+    pub const PROJECT_LIFECYCLE: [ToolName; 3] = [
+        ToolName::ListProjects,
+        ToolName::OpenProject,
+        ToolName::SaveProject,
+    ];
+
     /// Advanced workflows are schema-known but never unconditionally
     /// advertised. The desktop host appends only the exact capabilities backed
     /// by installed local models or a configured provider.
@@ -268,7 +280,7 @@ impl ToolName {
     /// hidden from discovery until a real backend exists. Keeping this set lets
     /// strict argument validation and compatibility tests cover future tools
     /// without advertising placeholder behavior to models.
-    pub const KNOWN: [ToolName; 60] = [
+    pub const KNOWN: [ToolName; 63] = [
         ToolName::GetTimeline,
         ToolName::GetMedia,
         ToolName::InspectMedia,
@@ -276,6 +288,9 @@ impl ToolName {
         ToolName::InspectTimeline,
         ToolName::SearchMedia,
         ToolName::ListModels,
+        ToolName::ListProjects,
+        ToolName::OpenProject,
+        ToolName::SaveProject,
         ToolName::AddClips,
         ToolName::InsertClips,
         ToolName::RemoveClips,
@@ -388,9 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn advertised_set_is_38_and_known_set_is_60() {
+    fn advertised_set_is_38_and_known_set_is_63() {
         assert_eq!(ToolName::ALL.len(), 38);
-        assert_eq!(ToolName::KNOWN.len(), 60);
+        assert_eq!(ToolName::KNOWN.len(), 63);
         assert!(ToolName::ALL
             .iter()
             .all(|tool| ToolName::KNOWN.contains(tool)));
