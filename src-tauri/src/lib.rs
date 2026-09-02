@@ -132,17 +132,28 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Background-run: don't quit. The actual hide waits for the
-                // bounded off-thread composite-cover save, so CloseRequested
-                // has parity with explicit Save without blocking the UI event
-                // thread on ffmpeg/GPU/bundle I/O.
+                // The actual close waits for the bounded off-thread
+                // composite-cover save, so CloseRequested has parity with
+                // explicit Save without blocking the UI event thread on
+                // ffmpeg/GPU/bundle I/O.
+                //
+                // macOS: background-run — hide the window, keep the Dock
+                // icon, reopen via RunEvent::Reopen. Other platforms have no
+                // Dock/tray to reopen from, so a hidden window meant a
+                // process that lived forever (UPSTREAM_ISSUES.md §4): there,
+                // close saves and then EXITS via the graceful path
+                // (RunEvent::Exit still runs, shutting external MCP down).
                 api.prevent_close();
                 let window = window.clone();
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let _ = commands::save_current_project_with_composite_cover(app).await;
+                    let _ =
+                        commands::save_current_project_with_composite_cover(app.clone()).await;
                     let _ = window.hide();
+                    #[cfg(target_os = "macos")]
                     let _ = window.app_handle().emit("go_home", ());
+                    #[cfg(not(target_os = "macos"))]
+                    app.exit(0);
                 });
             }
         })
