@@ -87,6 +87,8 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::DeleteFolder => "Deletes folders and everything inside them (subfolders and assets). Clips referencing any deleted asset are removed from the timeline in the same undoable action.",
 
+        ToolName::AddTrack => "Append an empty track of the given type and return its trackIndex. Use it IMMEDIATELY before add_clips with that explicit trackIndex when the timeline needs another layer (B-roll overlays above V1, a voiceover lane beside A1). Empty tracks are pruned when the next edit command runs and pruning re-indexes later tracks, so call add_clips as the very next edit; do not add_track several layers ahead. Tracks cannot be created implicitly by naming an unused trackIndex in add_clips/move_clips — those refuse unknown indices.",
+
         ToolName::ListProjects => "Project bundles in the projects folder (the folder the OPEN project lives in). Returns { projects: [{name, open}] }. Requires a saved project to be open so the folder is known. Names here are what open_project accepts.",
 
         ToolName::OpenProject => "Open a saved project bundle by name (from list_projects), REPLACING the timeline the GUI currently shows. Unsaved changes in the current project are lost — call save_project first if they matter. Returns the opened project's identity (projectEpoch, timelineVersion); previously fetched clipIds belong to the old project and are invalid afterwards.",
@@ -626,6 +628,13 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "type": {"type": "string", "enum": ["video", "image", "audio", "upscale"], "description": "Filter by type. Omit to list all models."}
             }),
             &[],
+        ),
+
+        ToolName::AddTrack => object(
+            json!({
+                "type": {"type": "string", "enum": ["video", "audio"], "description": "Zone the new track belongs to."}
+            }),
+            &["type"],
         ),
 
         ToolName::ListProjects => object(json!({}), &[]),

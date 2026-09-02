@@ -55,6 +55,16 @@ impl ToolArgs for OpenProjectArgs {
     const ALLOWED_KEYS: &'static [&'static str] = &["name"];
 }
 
+// --- add_track ---
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddTrackArgs {
+    pub r#type: String,
+}
+impl ToolArgs for AddTrackArgs {
+    const ALLOWED_KEYS: &'static [&'static str] = &["type"];
+}
+
 // --- add_clips ---
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

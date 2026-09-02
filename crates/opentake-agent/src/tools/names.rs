@@ -21,6 +21,7 @@ pub enum ToolName {
     OpenProject,
     SaveProject,
     // --- Timeline editing (11) ---
+    AddTrack,
     AddClips,
     InsertClips,
     RemoveClips,
@@ -124,6 +125,7 @@ impl ToolName {
             ToolName::ListProjects => "list_projects",
             ToolName::OpenProject => "open_project",
             ToolName::SaveProject => "save_project",
+            ToolName::AddTrack => "add_track",
             ToolName::AddClips => "add_clips",
             ToolName::InsertClips => "insert_clips",
             ToolName::RemoveClips => "remove_clips",
@@ -184,7 +186,7 @@ impl ToolName {
     /// Provider-backed generation, Motion, and vision-analysis tools are
     /// appended only when the current host reports their respective live
     /// capabilities.
-    pub const ALL: [ToolName; 38] = [
+    pub const ALL: [ToolName; 39] = [
         ToolName::GetTimeline,
         ToolName::GetMedia,
         ToolName::InspectMedia,
@@ -192,6 +194,7 @@ impl ToolName {
         ToolName::InspectTimeline,
         ToolName::SearchMedia,
         ToolName::ListModels,
+        ToolName::AddTrack,
         ToolName::AddClips,
         ToolName::InsertClips,
         ToolName::RemoveClips,
@@ -280,7 +283,7 @@ impl ToolName {
     /// hidden from discovery until a real backend exists. Keeping this set lets
     /// strict argument validation and compatibility tests cover future tools
     /// without advertising placeholder behavior to models.
-    pub const KNOWN: [ToolName; 63] = [
+    pub const KNOWN: [ToolName; 64] = [
         ToolName::GetTimeline,
         ToolName::GetMedia,
         ToolName::InspectMedia,
@@ -291,6 +294,7 @@ impl ToolName {
         ToolName::ListProjects,
         ToolName::OpenProject,
         ToolName::SaveProject,
+        ToolName::AddTrack,
         ToolName::AddClips,
         ToolName::InsertClips,
         ToolName::RemoveClips,
@@ -404,8 +408,8 @@ mod tests {
 
     #[test]
     fn advertised_set_is_38_and_known_set_is_63() {
-        assert_eq!(ToolName::ALL.len(), 38);
-        assert_eq!(ToolName::KNOWN.len(), 63);
+        assert_eq!(ToolName::ALL.len(), 39);
+        assert_eq!(ToolName::KNOWN.len(), 64);
         assert!(ToolName::ALL
             .iter()
             .all(|tool| ToolName::KNOWN.contains(tool)));

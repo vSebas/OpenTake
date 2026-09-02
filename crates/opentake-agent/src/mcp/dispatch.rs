@@ -213,6 +213,7 @@ pub(crate) fn dispatch_admission_class(name: &str, args: &Value) -> DispatchAdmi
         | ToolName::GenerateAvatar
         | ToolName::OpenProject
         | ToolName::SaveProject
+        | ToolName::AddTrack
         | ToolName::CloneVoice => DispatchAdmissionClass::Mutation,
     }
 }
@@ -793,6 +794,31 @@ impl Dispatcher {
             ToolName::InspectMedia => self.inspect_media(args, before, manifest),
 
             // --- Editing (wired to EditCommand) ---
+            ToolName::AddTrack => {
+                let a: AddTrackArgs = decode_tool_args(args, "")?;
+                let kind = match a.r#type.as_str() {
+                    "video" => opentake_domain::ClipType::Video,
+                    "audio" => opentake_domain::ClipType::Audio,
+                    other => {
+                        return Err(ToolError::new(format!(
+                            "add_track: type must be \"video\" or \"audio\", got {other:?}"
+                        )))
+                    }
+                };
+                let result = self.apply(EditCommand::InsertTrack { kind, at: None })?;
+                let new_track_id = result.affected_clip_ids.first().cloned();
+                let timeline = self.handle.timeline();
+                let track_index = new_track_id
+                    .and_then(|id| {
+                        timeline.tracks.iter().position(|track| track.id == id)
+                    })
+                    .ok_or_else(|| {
+                        ToolError::new("add_track: created track not found in timeline")
+                    })?;
+                Ok(ToolResult::ok(
+                    serde_json::json!({ "trackIndex": track_index }).to_string(),
+                ))
+            }
             ToolName::AddClips => self.add_clips(args, manifest, op),
             ToolName::InsertClips => self.insert_clips(args, before, manifest),
             ToolName::MoveClips => self.move_clips(args, before),
@@ -3095,6 +3121,7 @@ fn validate_tool_args(tool: ToolName, args: &Value) -> Result<(), ToolError> {
         ToolName::SearchMedia => decode!(SearchMediaArgs),
         ToolName::ListModels => decode!(ListModelsArgs),
         ToolName::OpenProject => decode!(OpenProjectArgs),
+        ToolName::AddTrack => decode!(AddTrackArgs),
         ToolName::AddClips => {
             decode!(AddClipsArgs);
             validate_array::<AddClipEntry>(args, "entries")?;
@@ -4917,6 +4944,59 @@ mod tests {
         let saved = d.dispatch("save_project", serde_json::json!({}));
         assert!(saved.text_joined().contains("savedTo"), "{}", saved.text_joined());
         assert_eq!(handle.saved.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn add_track_returns_index_and_add_clips_targets_it() {
+        let d = dispatcher_with(Arc::new(TestHandle::new()));
+        // Seeded timeline has one (empty) video track at index 0. Core
+        // prunes empty tracks on the next edit command, so the returned
+        // index is valid for the immediately following add_clips only —
+        // exactly how the tool description tells agents to use it.
+        let added = d.dispatch("add_track", serde_json::json!({"type": "video"}));
+        assert!(!added.is_error, "{}", added.text_joined());
+        assert!(added.text_joined().contains("\"trackIndex\":1"), "{}", added.text_joined());
+
+        let placed = d.dispatch(
+            "add_clips",
+            serde_json::json!({"entries": [{
+                "mediaRef": "clip-x", "startFrame": 0,
+                "durationFrames": 30, "trackIndex": 1,
+            }]}),
+        );
+        assert!(!placed.is_error, "{}", placed.text_joined());
+        let timeline = d.dispatch("get_timeline", serde_json::json!({}));
+        assert!(timeline.text_joined().contains("clip-x"), "{}", timeline.text_joined());
+
+        // A new audio track lands in the audio zone; get_timeline confirms
+        // the returned index really is an audio track.
+        let audio = d.dispatch("add_track", serde_json::json!({"type": "audio"}));
+        assert!(!audio.is_error, "{}", audio.text_joined());
+        let index: usize = serde_json::from_str::<serde_json::Value>(&audio.text_joined())
+            .ok()
+            .and_then(|v| v.get("trackIndex").and_then(|i| i.as_u64()))
+            .expect("trackIndex in add_track result") as usize;
+        let timeline = d.dispatch("get_timeline", serde_json::json!({}));
+        let joined = timeline.text_joined();
+        let parsed: serde_json::Value = serde_json::Deserializer::from_str(&joined)
+            .into_iter()
+            .next()
+            .expect("timeline json")
+            .expect("valid timeline json");
+        let track = &parsed["tracks"][index];
+        assert_eq!(track["type"], "audio", "{parsed}");
+
+        let refused = d.dispatch(
+            "add_clips",
+            serde_json::json!({"entries": [{
+                "mediaRef": "clip-x", "startFrame": 0,
+                "durationFrames": 30, "trackIndex": 99,
+            }]}),
+        );
+        assert!(refused.is_error, "unknown trackIndex must be refused");
+
+        let bad = d.dispatch("add_track", serde_json::json!({"type": "title"}));
+        assert!(bad.is_error);
     }
 
     #[test]
