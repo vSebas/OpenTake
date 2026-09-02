@@ -18,6 +18,7 @@ use opentake_agent::mcp::{
     server::{bind_managed_gated_on, ManagedMcpEndpoint},
     AuthenticatedMcpClient, BearerAuthorizer,
 };
+#[cfg(feature = "external-mcp-integration")]
 use opentake_core::AppCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -387,11 +388,11 @@ impl ExternalMcpIntegrationHarness {
             Some(cancel_probe.clone()),
         ));
         let components = ExternalMcpComponents {
+            core: core.clone(),
             dispatcher,
             registry,
         };
         let state = ExternalMcpState::load(
-            core.clone(),
             components,
             app_data_dir,
             Arc::new(opentake_gen::KeyringStore::with_service(keychain_service)),
@@ -467,11 +468,7 @@ enum ExternalMcpAdmission {
 }
 
 impl ExternalMcpState {
-    pub(crate) fn new(
-        core: AppCore,
-        components: ExternalMcpComponents,
-        catalog: ExternalMcpCatalog,
-    ) -> Self {
+    pub(crate) fn new(components: ExternalMcpComponents, catalog: ExternalMcpCatalog) -> Self {
         let credentials = catalog.load_active_credentials().unwrap_or_default();
         let catalog = Arc::new(RwLock::new(catalog));
         let last_use = Arc::new(LastUseTracker::default());
@@ -479,7 +476,7 @@ impl ExternalMcpState {
             credentials: RwLock::new(Arc::new(credentials)),
             last_use,
         });
-        let gate = LiveProjectMcpGate::new(core.clone());
+        let gate = LiveProjectMcpGate::new(components.core.clone());
         Self {
             components,
             catalog,
@@ -500,7 +497,6 @@ impl ExternalMcpState {
     }
 
     pub(crate) fn load(
-        core: AppCore,
         components: ExternalMcpComponents,
         app_data_dir: &Path,
         secrets: Arc<dyn McpSecretStore>,
@@ -515,7 +511,7 @@ impl ExternalMcpState {
         match ExternalMcpCatalog::load(app_data_dir, secrets.clone()) {
             Ok(catalog) if preferences.is_ok() => {
                 let preferences = preferences.expect("checked external MCP preferences");
-                let mut state = Self::new(core, components, catalog);
+                let mut state = Self::new(components, catalog);
                 state.lifecycle = Arc::new(tokio::sync::Mutex::new(ExternalMcpLifecycle {
                     admission: ExternalMcpAdmission::Running,
                     enabled: preferences.enabled,
@@ -537,7 +533,7 @@ impl ExternalMcpState {
                     (None, None) => "external MCP authentication is unavailable".to_string(),
                 };
                 let catalog = ExternalMcpCatalog::unavailable(app_data_dir, secrets);
-                let mut state = Self::new(core, components, catalog);
+                let mut state = Self::new(components, catalog);
                 state.lifecycle = Arc::new(tokio::sync::Mutex::new(ExternalMcpLifecycle {
                     admission: ExternalMcpAdmission::Running,
                     enabled,
@@ -551,15 +547,11 @@ impl ExternalMcpState {
         }
     }
 
-    pub(crate) fn auth_failure(
-        core: AppCore,
-        components: ExternalMcpComponents,
-        error: String,
-    ) -> Self {
+    pub(crate) fn auth_failure(components: ExternalMcpComponents, error: String) -> Self {
         let root = std::env::temp_dir().join("opentake-unavailable-app-data");
         let catalog =
             ExternalMcpCatalog::unavailable(&root, Arc::new(opentake_gen::KeyringStore::new()));
-        let mut state = Self::new(core, components, catalog);
+        let mut state = Self::new(components, catalog);
         state.lifecycle = Arc::new(tokio::sync::Mutex::new(ExternalMcpLifecycle {
             admission: ExternalMcpAdmission::Running,
             enabled: false,
@@ -2123,8 +2115,25 @@ mod tests {
             root.path().join("chat-models"),
         );
         let catalog = load_catalog(root, Arc::new(MemoryMcpSecretStore::default()));
-        let external = ExternalMcpState::new(core, chat.external_mcp_components(), catalog);
+        let external = ExternalMcpState::new(chat.external_mcp_components(), catalog);
         (chat, external)
+    }
+
+    fn dispatch_live(
+        state: &ExternalMcpState,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> opentake_agent::tools::result::ToolResult {
+        state
+            .gate
+            .dispatch_cancellable_scoped(
+                &state.components.dispatcher,
+                name,
+                arguments,
+                "opentake:mcp:test",
+                &opentake_media::MediaCancelToken::new(),
+            )
+            .expect("saved live project accepts the dispatch")
     }
 
     fn lifecycle_state(
@@ -2138,7 +2147,7 @@ mod tests {
             root.path().join("chat-cache"),
             root.path().join("chat-models"),
         );
-        ExternalMcpState::load(core, chat.external_mcp_components(), root.path(), secrets)
+        ExternalMcpState::load(chat.external_mcp_components(), root.path(), secrets)
     }
 
     fn lifecycle_state_with_gate(
@@ -2407,7 +2416,7 @@ mod tests {
         );
         let mut catalog = load_catalog(&root, Arc::new(MemoryMcpSecretStore::default()));
         let receipt = catalog.pair("Cursor").expect("pair client");
-        let state = ExternalMcpState::new(core, chat.external_mcp_components(), catalog);
+        let state = ExternalMcpState::new(chat.external_mcp_components(), catalog);
         let lifecycle = state.lifecycle.blocking_lock();
 
         let receipt_json = serde_json::to_string(&receipt).expect("serialize receipt");
@@ -2930,7 +2939,7 @@ mod tests {
             root.path().join("chat-cache"),
             root.path().join("chat-models"),
         );
-        let state = ExternalMcpState::new(core, chat.external_mcp_components(), catalog);
+        let state = ExternalMcpState::new(chat.external_mcp_components(), catalog);
         secrets.reset_loads();
         let writes_before = state.catalog_publish_count_for_test();
 
@@ -3111,7 +3120,7 @@ mod tests {
         let expected = chat.external_mcp_components();
         let catalog = load_catalog(&root, Arc::new(MemoryMcpSecretStore::default()));
 
-        let external = ExternalMcpState::new(core, chat.external_mcp_components(), catalog);
+        let external = ExternalMcpState::new(chat.external_mcp_components(), catalog);
 
         assert!(Arc::ptr_eq(
             &external.components.dispatcher,
@@ -3141,6 +3150,69 @@ mod tests {
         assert!(core.media().folders.is_empty());
     }
 
+    #[test]
+    fn external_timeline_reflects_gui_edit_after_session_construction() {
+        use opentake_domain::{ClipType, MediaManifestEntry, MediaSource};
+        use opentake_ops::command::{ClipEntry, EditCommand};
+
+        let root = catalog_root();
+        let core = opentake_core::AppCore::new();
+        core.save_project(Some(root.path().join("Shared.opentake")))
+            .expect("save shared project");
+        let (_chat, external) = shared_state(&root, core.clone());
+        let media = MediaManifestEntry {
+            id: "asset-a".into(),
+            name: "asset-a.mp4".into(),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: "media/asset-a.mp4".into(),
+            },
+            duration: 2.0,
+            generation_input: None,
+            source_width: Some(64),
+            source_height: Some(36),
+            source_fps: Some(30.0),
+            has_audio: Some(false),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        };
+        let added = core
+            .apply(EditCommand::RegisterMediaAndAddClip {
+                media,
+                entry: ClipEntry {
+                    media_ref: "asset-a".into(),
+                    media_type: ClipType::Video,
+                    source_clip_type: ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 30,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: false,
+                    add_linked_audio: false,
+                    transform: None,
+                },
+                auto_track: true,
+            })
+            .expect("place fixture clip");
+        let clip_id = added.affected_clip_ids[0].clone();
+
+        let before = dispatch_live(&external, "get_timeline", serde_json::json!({}));
+        assert!(before.text_joined().contains(&clip_id));
+
+        core.apply(EditCommand::RemoveClips {
+            clip_ids: vec![clip_id.clone()],
+        })
+        .expect("apply GUI-side removal");
+        core.save_project(None).expect("save GUI-side edit");
+
+        let after = dispatch_live(&external, "get_timeline", serde_json::json!({}));
+        assert!(!after.text_joined().contains(&clip_id));
+    }
+
     #[tokio::test]
     async fn shared_catalog_authorizer_tracks_regenerated_credentials_without_exporting_them() {
         let root = catalog_root();
@@ -3153,7 +3225,7 @@ mod tests {
         );
         let mut catalog = load_catalog(&root, Arc::new(MemoryMcpSecretStore::default()));
         let first = catalog.pair("Claude Desktop").expect("pair client");
-        let external = ExternalMcpState::new(core, chat.external_mcp_components(), catalog);
+        let external = ExternalMcpState::new(chat.external_mcp_components(), catalog);
 
         let first_client = external
             .authorizer
@@ -3193,7 +3265,7 @@ mod tests {
         let chat_gate = chat.project_turn_gate_for_test("chat-session");
         let mut catalog = load_catalog(&root, Arc::new(MemoryMcpSecretStore::default()));
         let paired = catalog.pair("Claude Desktop").expect("pair test client");
-        let external = ExternalMcpState::new(core.clone(), chat.external_mcp_components(), catalog);
+        let external = ExternalMcpState::new(chat.external_mcp_components(), catalog);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind managed MCP test listener");

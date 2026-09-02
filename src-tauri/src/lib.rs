@@ -226,13 +226,11 @@ pub fn run() {
             );
             let external_mcp_state = match app.path().app_data_dir() {
                 Ok(data_dir) => external_mcp::ExternalMcpState::load(
-                    core.clone(),
                     chat_state.external_mcp_components(),
                     &data_dir,
                     Arc::new(opentake_gen::KeyringStore::new()),
                 ),
                 Err(error) => external_mcp::ExternalMcpState::auth_failure(
-                    core.clone(),
                     chat_state.external_mcp_components(),
                     format!("could not resolve external MCP application data directory: {error}"),
                 ),

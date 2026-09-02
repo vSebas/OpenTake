@@ -51,6 +51,7 @@ pub struct ChatState {
 #[derive(Clone)]
 #[allow(dead_code)] // Task 4's listener consumes both handles.
 pub(crate) struct ExternalMcpComponents {
+    pub(crate) core: AppCore,
     pub(crate) dispatcher: Arc<Dispatcher>,
     pub(crate) registry: Arc<RwLock<PluginRegistry>>,
 }
@@ -182,6 +183,7 @@ impl ChatProjectContext {
 impl ChatState {
     pub(crate) fn external_mcp_components(&self) -> ExternalMcpComponents {
         ExternalMcpComponents {
+            core: self.core.clone(),
             dispatcher: self.dispatcher.clone(),
             registry: self.registry.clone(),
         }
