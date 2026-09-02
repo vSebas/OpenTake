@@ -1,6 +1,6 @@
 # Issue drafts for appergb/OpenTake (from the video-edit trial fork)
 
-## 1. External MCP serves a stale timeline after GUI edits (state divergence)
+## 1. External MCP serves a stale timeline after GUI edits (FIXED in fork d66b6f6)
 
 Observed on Linux (source build, v1.0.0-beta.5 + trial patches), single app
 session:
@@ -36,14 +36,14 @@ pool + circuit breaker (happy to PR).
 
 ## 4. Smaller items
 
-- Window close can leave the process running (Linux); reproduced repeatedly.
+- Window close can leave the process running (Linux); reproduced repeatedly. (FIXED in fork 0676d06: close saves and exits on non-macOS.)
 - Export progress can read 0% while working when the main thread stalls
   (root cause = issue 2).
 - Compositor horizontally squeezes wide (16:9) sources placed in a portrait
   project instead of letterboxing.
 - Native menu does not rebuild on language switch (restart applies it).
 
-## 5. set_clip_properties on one linked clip silently mutates its partner
+## 5. set_clip_properties on one linked clip silently mutates its partner (FIXED in fork 4aa0a26: refusal by default, allowLinkDivergence for J/L)
 
 Probed live 2026-09-01 (v1.0.0-beta.5 + trial patches): changing
 `trimStartFrame` on the AUDIO clip of a linked pair returns success, but the
