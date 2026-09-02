@@ -182,6 +182,7 @@ pub struct SetClipPropertiesArgs {
     pub color: Option<String>,
     pub alignment: Option<String>,
     pub reversed: Option<bool>,
+    pub allow_link_divergence: Option<bool>,
 }
 impl ToolArgs for SetClipPropertiesArgs {
     const ALLOWED_KEYS: &'static [&'static str] = &[
@@ -198,6 +199,7 @@ impl ToolArgs for SetClipPropertiesArgs {
         "fontSize",
         "color",
         "alignment",
+        "allowLinkDivergence",
         "reversed",
     ];
 }
@@ -265,6 +267,7 @@ impl ToolArgs for AddTextEntry {
         "fontSize",
         "color",
         "alignment",
+        "allowLinkDivergence",
     ];
 }
 

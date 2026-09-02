@@ -2320,6 +2320,96 @@ mod tests {
     }
 
     #[test]
+    fn divergent_linked_pair_survives_save_and_reopen() {
+        use opentake_ops::command::ClipProperties;
+
+        let bundle = project_bundle("divergent-pair");
+        let core = AppCore::new();
+        core.open_project(&bundle).unwrap();
+        core.apply(EditCommand::RegisterMediaAndAddClip {
+            media: opentake_domain::MediaManifestEntry {
+                id: "pair-src".into(),
+                name: "pair-src.mp4".into(),
+                kind: ClipType::Video,
+                source: opentake_domain::MediaSource::Project {
+                    relative_path: "media/pair-src.mp4".into(),
+                },
+                duration: 4.0,
+                generation_input: None,
+                source_width: Some(64),
+                source_height: Some(36),
+                source_fps: Some(30.0),
+                has_audio: Some(true),
+                color: None,
+                proxy: None,
+                folder_id: None,
+                cached_remote_url: None,
+                cached_remote_url_expires_at: None,
+            },
+            entry: ClipEntry {
+                media_ref: "pair-src".into(),
+                media_type: ClipType::Video,
+                source_clip_type: ClipType::Video,
+                track_index: 0,
+                start_frame: 0,
+                duration_frames: 60,
+                trim_start_frame: None,
+                trim_end_frame: None,
+                has_audio: true,
+                add_linked_audio: true,
+                transform: None,
+            },
+            auto_track: true,
+        })
+        .unwrap();
+        let timeline = core.get_timeline().timeline;
+        let audio = timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == ClipType::Audio)
+            .and_then(|t| t.clips.first())
+            .expect("linked audio partner");
+        let audio_id = audio.id.clone();
+        let link = audio.link_group_id.clone().expect("pair is linked");
+
+        // J-cut shape: the audio clip diverges; the video partner must not move.
+        core.apply(EditCommand::SetClipPropertiesDiverging {
+            clip_ids: vec![audio_id.clone()],
+            properties: Box::new(ClipProperties {
+                trim_start_frame: Some(12),
+                duration_frames: Some(48),
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        core.save_project(None).unwrap();
+
+        let reopened = AppCore::new();
+        reopened.open_project(&bundle).unwrap();
+        let timeline = reopened.get_timeline().timeline;
+        let video = timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == ClipType::Video)
+            .and_then(|t| t.clips.first())
+            .expect("video clip");
+        let audio = timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == ClipType::Audio)
+            .and_then(|t| t.clips.first())
+            .expect("audio clip");
+        assert_eq!(video.duration_frames, 60, "video untouched");
+        assert_eq!(
+            (audio.trim_start_frame, audio.duration_frames),
+            (12, 48),
+            "audio divergence persisted"
+        );
+        assert_eq!(audio.link_group_id.as_ref(), Some(&link), "still linked");
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
     fn motion_media_commit_is_durable_atomic_and_one_step_undoable() {
         let bundle = project_bundle("motion-commit");
         let core = AppCore::new();

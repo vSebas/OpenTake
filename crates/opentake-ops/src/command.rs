@@ -907,6 +907,15 @@ pub enum EditCommand {
         clip_ids: Vec<String>,
         properties: Box<ClipProperties>,
     },
+    /// Like [`EditCommand::SetClipProperties`] but timing changes do NOT
+    /// propagate to linked partners: the named clips diverge from their link
+    /// group's shared geometry while REMAINING linked for selection, move,
+    /// and delete. This is how an agent authors J/L cuts (audio leading or
+    /// trailing its picture).
+    SetClipPropertiesDiverging {
+        clip_ids: Vec<String>,
+        properties: Box<ClipProperties>,
+    },
     /// Apply clip-specific property bundles as one atomic undoable edit. This is
     /// used when a shared partial transform has to be resolved against each
     /// source clip's current aspect ratio before committing.
@@ -1316,7 +1325,11 @@ pub fn apply(
         EditCommand::SetClipProperties {
             clip_ids,
             properties,
-        } => set_clip_properties(state, clip_ids, *properties),
+        } => set_clip_properties(state, clip_ids, *properties, true),
+        EditCommand::SetClipPropertiesDiverging {
+            clip_ids,
+            properties,
+        } => set_clip_properties(state, clip_ids, *properties, false),
         EditCommand::SetClipPropertiesPerClip { assignments } => {
             set_clip_properties_per_clip(state, assignments)
         }
@@ -3969,6 +3982,7 @@ fn set_clip_properties(
     state: &mut EditorState,
     clip_ids: Vec<String>,
     props: ClipProperties,
+    propagate_timing_to_partners: bool,
 ) -> Result<EditResult, EditError> {
     if clip_ids.is_empty() {
         return Err(EditError::Invalid(
@@ -3978,11 +3992,13 @@ fn set_clip_properties(
     for id in &clip_ids {
         validate_clip_property_target(state, id, &props)?;
     }
-    // Timing changes propagate to linked partners (trim/speed dropped for text).
-    let propagates_timing = props.duration_frames.is_some()
-        || props.trim_start_frame.is_some()
-        || props.trim_end_frame.is_some()
-        || props.speed.is_some();
+    // Timing changes propagate to linked partners (trim/speed dropped for
+    // text) unless the caller explicitly asked for link divergence.
+    let propagates_timing = propagate_timing_to_partners
+        && (props.duration_frames.is_some()
+            || props.trim_start_frame.is_some()
+            || props.trim_end_frame.is_some()
+            || props.speed.is_some());
     let partners: HashSet<String> = if propagates_timing {
         ops::timing_propagation_partners(&state.timeline, &clip_ids.iter().cloned().collect())
     } else {

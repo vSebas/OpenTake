@@ -2692,11 +2692,55 @@ impl Dispatcher {
             reversed: a.reversed,
             ..Default::default()
         };
+        // Timing changes on one clip of a linked pair used to propagate to
+        // the partner SILENTLY — the caller asked to change one clip and two
+        // changed. Now: refuse with the partner named, unless the caller
+        // either includes the partner explicitly (both change, linked
+        // behavior) or passes allowLinkDivergence=true (only the named clips
+        // change; the pair stays linked for selection/move/delete — this is
+        // how J/L cuts are authored).
+        let changes_timing = a.duration_frames.is_some()
+            || a.trim_start_frame.is_some()
+            || a.trim_end_frame.is_some()
+            || a.speed.is_some();
+        let diverge = a.allow_link_divergence == Some(true);
+        if changes_timing && !diverge {
+            let requested: std::collections::HashSet<&str> =
+                clip_ids.iter().map(String::as_str).collect();
+            for clip_id in &clip_ids {
+                let Some(clip) = find_clip(before, clip_id) else { continue };
+                let Some(group) = clip.link_group_id.as_deref() else { continue };
+                for track in &before.tracks {
+                    for other in &track.clips {
+                        if other.link_group_id.as_deref() == Some(group)
+                            && !requested.contains(other.id.as_str())
+                        {
+                            return Err(ToolError::new(format!(
+                                "set_clip_properties: {clip_id} is linked to \
+                                 {partner}; a timing change would affect both. \
+                                 Include both clipIds to change them together, \
+                                 or pass allowLinkDivergence=true to change \
+                                 only {clip_id} (J/L cut).",
+                                partner = other.id,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let Some(transform_patch) = a.transform else {
-            let res = self.apply(EditCommand::SetClipProperties {
-                clip_ids,
-                properties: Box::new(properties),
-            })?;
+            let command = if diverge {
+                EditCommand::SetClipPropertiesDiverging {
+                    clip_ids,
+                    properties: Box::new(properties),
+                }
+            } else {
+                EditCommand::SetClipProperties {
+                    clip_ids,
+                    properties: Box::new(properties),
+                }
+            };
+            let res = self.apply(command)?;
             return Ok(ToolResult::ok(res.summary));
         };
 
@@ -4997,6 +5041,104 @@ mod tests {
 
         let bad = d.dispatch("add_track", serde_json::json!({"type": "title"}));
         assert!(bad.is_error);
+    }
+
+    #[test]
+    fn linked_timing_refuses_by_default_and_diverges_with_flag() {
+        let handle = Arc::new(TestHandle::new());
+        // Register real video-with-audio media and place it so a linked
+        // audio partner is created (auto track).
+        let media = MediaManifestEntry {
+            id: "pair-src".into(),
+            name: "pair-src.mp4".into(),
+            kind: ClipType::Video,
+            source: MediaSource::Project {
+                relative_path: "media/pair-src.mp4".into(),
+            },
+            duration: 4.0,
+            generation_input: None,
+            source_width: Some(64),
+            source_height: Some(36),
+            source_fps: Some(30.0),
+            has_audio: Some(true),
+            color: None,
+            proxy: None,
+            folder_id: None,
+            cached_remote_url: None,
+            cached_remote_url_expires_at: None,
+        };
+        handle
+            .core
+            .apply(EditCommand::RegisterMediaAndAddClip {
+                media,
+                entry: opentake_ops::command::ClipEntry {
+                    media_ref: "pair-src".into(),
+                    media_type: ClipType::Video,
+                    source_clip_type: ClipType::Video,
+                    track_index: 0,
+                    start_frame: 0,
+                    duration_frames: 60,
+                    trim_start_frame: None,
+                    trim_end_frame: None,
+                    has_audio: true,
+                    add_linked_audio: true,
+                    transform: None,
+                },
+                auto_track: true,
+            })
+            .expect("place linked pair");
+        let d = dispatcher_with(handle);
+        let joined = d.dispatch("get_timeline", serde_json::json!({})).text_joined();
+        let parsed: serde_json::Value = serde_json::Deserializer::from_str(&joined)
+            .into_iter().next().unwrap().unwrap();
+        let audio_id = parsed["tracks"]
+            .as_array().unwrap().iter()
+            .find(|t| t["type"] == "audio")
+            .and_then(|t| t["clips"][0]["clipId"].as_str())
+            .map(str::to_owned)
+            .expect("linked audio partner must exist for this test");
+
+        // Default: timing change on one clip of the pair is refused, naming
+        // the partner.
+        let refused = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({"clipIds": [audio_id], "trimStartFrame": 12}),
+        );
+        assert!(refused.is_error, "{}", refused.text_joined());
+        assert!(refused.text_joined().contains("allowLinkDivergence"),
+            "{}", refused.text_joined());
+
+        // With the flag: only the audio clip changes; the pair stays linked.
+        let diverged = d.dispatch(
+            "set_clip_properties",
+            serde_json::json!({
+                "clipIds": [audio_id], "trimStartFrame": 12,
+                "durationFrames": 48, "allowLinkDivergence": true,
+            }),
+        );
+        assert!(!diverged.is_error, "{}", diverged.text_joined());
+        let joined = d.dispatch("get_timeline", serde_json::json!({})).text_joined();
+        let parsed: serde_json::Value = serde_json::Deserializer::from_str(&joined)
+            .into_iter().next().unwrap().unwrap();
+        let mut video_duration = None;
+        let mut audio_state = None;
+        for track in parsed["tracks"].as_array().unwrap() {
+            for clip in track["clips"].as_array().unwrap_or(&vec![]).iter() {
+                if clip["clipId"] == serde_json::json!(audio_id) {
+                    audio_state = Some((
+                        clip["trimStartFrame"].as_i64().unwrap_or(0),
+                        clip["durationFrames"].as_i64().unwrap(),
+                        clip["linkGroupId"].clone(),
+                    ));
+                } else if track["type"] == "video" {
+                    video_duration = clip["durationFrames"].as_i64();
+                }
+            }
+        }
+        let (trim, duration, link) = audio_state.expect("audio clip still present");
+        assert_eq!((trim, duration), (12, 48));
+        assert_eq!(video_duration, Some(60), "video partner must be untouched");
+        assert!(link.is_string(), "divergent pair must remain linked");
     }
 
     #[test]
