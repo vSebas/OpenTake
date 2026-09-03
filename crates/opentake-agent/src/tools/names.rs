@@ -20,6 +20,7 @@ pub enum ToolName {
     ListProjects,
     OpenProject,
     SaveProject,
+    NewProject,
     // --- Timeline editing (11) ---
     AddTrack,
     AddClips,
@@ -125,6 +126,7 @@ impl ToolName {
             ToolName::ListProjects => "list_projects",
             ToolName::OpenProject => "open_project",
             ToolName::SaveProject => "save_project",
+            ToolName::NewProject => "new_project",
             ToolName::AddTrack => "add_track",
             ToolName::AddClips => "add_clips",
             ToolName::InsertClips => "insert_clips",
@@ -258,10 +260,11 @@ impl ToolName {
     /// in all other hosts.
     pub const VISION: [ToolName; 1] = [ToolName::SmartReframe];
 
-    pub const PROJECT_LIFECYCLE: [ToolName; 3] = [
+    pub const PROJECT_LIFECYCLE: [ToolName; 4] = [
         ToolName::ListProjects,
         ToolName::OpenProject,
         ToolName::SaveProject,
+        ToolName::NewProject,
     ];
 
     /// Advanced workflows are schema-known but never unconditionally
@@ -283,7 +286,7 @@ impl ToolName {
     /// hidden from discovery until a real backend exists. Keeping this set lets
     /// strict argument validation and compatibility tests cover future tools
     /// without advertising placeholder behavior to models.
-    pub const KNOWN: [ToolName; 64] = [
+    pub const KNOWN: [ToolName; 65] = [
         ToolName::GetTimeline,
         ToolName::GetMedia,
         ToolName::InspectMedia,
@@ -294,6 +297,7 @@ impl ToolName {
         ToolName::ListProjects,
         ToolName::OpenProject,
         ToolName::SaveProject,
+        ToolName::NewProject,
         ToolName::AddTrack,
         ToolName::AddClips,
         ToolName::InsertClips,
@@ -409,7 +413,7 @@ mod tests {
     #[test]
     fn advertised_set_is_38_and_known_set_is_63() {
         assert_eq!(ToolName::ALL.len(), 39);
-        assert_eq!(ToolName::KNOWN.len(), 64);
+        assert_eq!(ToolName::KNOWN.len(), 65);
         assert!(ToolName::ALL
             .iter()
             .all(|tool| ToolName::KNOWN.contains(tool)));

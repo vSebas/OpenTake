@@ -95,6 +95,8 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::SaveProject => "Save the open project back to its bundle on disk (what the GUI's save does). Returns { savedTo }. Fails when the project has never been saved (no bundle to save into).",
 
+        ToolName::NewProject => "Create a NEW empty project bundle named {name} in the projects folder and open it, REPLACING the timeline the GUI currently shows (unsaved changes in the current project are lost — call save_project first if they matter). Fails if a bundle with that name already exists (use open_project) or when the projects folder is unknown (open any saved project once). Returns the new project's identity (projectEpoch, timelineVersion).",
+
         ToolName::ListModels => "Lists AI models with their capabilities (durations, aspect ratios, resolutions, first/last frame support, reference support, voices/category for audio, upscaler speed). Always call before generate_video, generate_image, generate_audio, or upscale_media so the model you pick actually supports the constraints you need. Returns { models, loaded } — if loaded=false the catalog hasn't synced yet (e.g. user not signed in); the models array may be empty even when models exist, so do not conclude no models are available. Retry after the user signs in.",
 
         // --- OpenTake workflow-plugin tools (agent-SPEC §7.4; OpenTake-authored, styled to match upstream) ---
@@ -648,6 +650,13 @@ pub fn input_schema(tool: ToolName) -> Value {
         ),
 
         ToolName::SaveProject => object(json!({}), &[]),
+
+        ToolName::NewProject => object(
+            json!({
+                "name": {"type": "string", "description": "Plain bundle name to create (no paths); '.opentake' is appended automatically."}
+            }),
+            &["name"],
+        ),
 
         ToolName::ActivateWorkflow => object(
             json!({

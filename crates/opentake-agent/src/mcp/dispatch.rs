@@ -213,6 +213,7 @@ pub(crate) fn dispatch_admission_class(name: &str, args: &Value) -> DispatchAdmi
         | ToolName::GenerateAvatar
         | ToolName::OpenProject
         | ToolName::SaveProject
+        | ToolName::NewProject
         | ToolName::AddTrack
         | ToolName::CloneVoice => DispatchAdmissionClass::Mutation,
     }
@@ -789,6 +790,48 @@ impl Dispatcher {
                     .map_err(|e| ToolError::new(format!("save_project: {e}")))?;
                 Ok(ToolResult::ok(
                     serde_json::json!({ "savedTo": saved.to_string_lossy() }).to_string(),
+                ))
+            }
+            ToolName::NewProject => {
+                let a: NewProjectArgs = decode_tool_args(args, "")?;
+                let name = a.name.trim();
+                if name.is_empty()
+                    || name.contains('/')
+                    || name.contains('\\')
+                    || name.contains("..")
+                {
+                    return Err(ToolError::new(
+                        "new_project: name must be a plain bundle name (no paths)",
+                    ));
+                }
+                let root = self.handle.projects_root().ok_or_else(|| {
+                    ToolError::new(
+                        "new_project: no saved project is open, so the \
+                         projects folder is unknown — open one in OpenTake first",
+                    )
+                })?;
+                let bundle = if name.ends_with(".opentake") {
+                    root.join(name)
+                } else {
+                    root.join(format!("{name}.opentake"))
+                };
+                if bundle.exists() {
+                    return Err(ToolError::new(format!(
+                        "new_project: a bundle named {name:?} already exists — \
+                         use open_project"
+                    )));
+                }
+                let (project_epoch, timeline_version) = self
+                    .handle
+                    .new_project_bundle(&bundle)
+                    .map_err(|e| ToolError::new(format!("new_project: {e}")))?;
+                Ok(ToolResult::ok(
+                    serde_json::json!({
+                        "name": name.trim_end_matches(".opentake"),
+                        "projectEpoch": project_epoch,
+                        "timelineVersion": timeline_version,
+                    })
+                    .to_string(),
                 ))
             }
             ToolName::InspectMedia => self.inspect_media(args, before, manifest),
@@ -3165,6 +3208,7 @@ fn validate_tool_args(tool: ToolName, args: &Value) -> Result<(), ToolError> {
         ToolName::SearchMedia => decode!(SearchMediaArgs),
         ToolName::ListModels => decode!(ListModelsArgs),
         ToolName::OpenProject => decode!(OpenProjectArgs),
+        ToolName::NewProject => decode!(NewProjectArgs),
         ToolName::AddTrack => decode!(AddTrackArgs),
         ToolName::AddClips => {
             decode!(AddClipsArgs);

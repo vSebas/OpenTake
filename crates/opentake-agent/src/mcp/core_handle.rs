@@ -109,6 +109,10 @@ pub trait CoreHandle: Send + Sync {
         anyhow::bail!("this host does not support opening projects over MCP")
     }
 
+    fn new_project_bundle(&self, _path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+        anyhow::bail!("this host does not support project lifecycle")
+    }
+
     /// Save the open project back to its bundle. Returns the written path.
     fn save_open_project(&self) -> anyhow::Result<PathBuf> {
         anyhow::bail!("this host does not support saving projects over MCP")
@@ -238,6 +242,14 @@ impl CoreHandle for AppCoreHandle {
         let snapshot = self
             .0
             .open_project(path)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok((snapshot.project_epoch, snapshot.version))
+    }
+
+    fn new_project_bundle(&self, path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+        let snapshot = self.0.new_project();
+        self.0
+            .save_project(Some(path.to_path_buf()))
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok((snapshot.project_epoch, snapshot.version))
     }
