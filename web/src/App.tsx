@@ -20,7 +20,9 @@ import { startLibrarySync, stopLibrarySync } from "./store/libraryStore";
 import { useEditorUiStore } from "./store/uiStore";
 import { initI18n } from "./i18n";
 import { initProxyPlayback, initWindowSize } from "./store/settingsStore";
-import { isTauri, onGoHome } from "./lib/api";
+import { isTauri, onGoHome, onProjectOpened } from "./lib/api";
+import { openProjectPath } from "./store/projectActions";
+import { useProjectStore } from "./store/projectStore";
 import { stopNativePlaybackForProjectBoundary } from "./components/preview/nativePlaybackSession";
 import { useUpdateStore } from "./store/updateStore";
 import { startUpdateScheduler } from "./lib/updateScheduler";
@@ -120,6 +122,7 @@ export default function App() {
     let disposed = false;
     const retryTimers = new Set<ReturnType<typeof setTimeout>>();
     let unlisten: (() => void) | undefined;
+    let externalOpenUnlisten: (() => void) | undefined;
 
     const reportLifecycleFailure = (label: string, error: unknown, retrying: boolean) => {
       const suffix = retrying
@@ -204,6 +207,24 @@ export default function App() {
       },
       (registeredUnlisten) => registeredUnlisten(),
     );
+    // A project opened OUTSIDE the GUI (e.g. Vlog Studio placing a cut over
+    // MCP) fires project_opened but never navigates the window. GUI-driven
+    // opens set the store BEFORE this fires, so the path already matches and
+    // we skip — only external opens differ, and we load+navigate to them.
+    launchWithRetry(
+      "外部项目导航失败 / External project navigation failed",
+      () =>
+        onProjectOpened((path) => {
+          if (disposed || !path) return;
+          if (useProjectStore.getState().projectPath === path) return;
+          void openProjectPath(path).catch(() => {});
+        }),
+      (registeredUnlisten) => {
+        externalOpenUnlisten?.();
+        externalOpenUnlisten = registeredUnlisten;
+      },
+      (registeredUnlisten) => registeredUnlisten(),
+    );
     // Suppress the WebView's native context menu (the stray "Reload" item) so
     // app-native menus can own right-click; allow it in text fields.
     const onContextMenu = (e: MouseEvent) => {
@@ -224,6 +245,7 @@ export default function App() {
       retryTimers.clear();
       unsubscribeView();
       unlisten?.();
+      externalOpenUnlisten?.();
       stopSync();
       stopMediaSync();
       stopLibrarySync();
