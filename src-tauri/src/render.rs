@@ -784,6 +784,7 @@ impl MediaResolver<'_> {
         let first_index = source_position.floor().max(0.0) as i64;
         let next_index = source_position.ceil().max(0.0) as i64;
         let alpha = source_position - first_index as f64;
+        let media_ref_owned = media_ref.to_string();
         let decode = |index: i64| {
             let request = FrameRequest {
                 time_secs: index as f64 / source_fps,
@@ -795,6 +796,16 @@ impl MediaResolver<'_> {
                 Some(file) => decode_frame_file_at_cancellable(file, &request, self.cancel),
                 None => decode_frame_at_cancellable(&info.path, &request, self.cancel),
             }
+            .map_err(|error| {
+                // preserve the real decode failure category (Codex review):
+                // "decode failed" alone hid whether it was cancellation, an
+                // ffmpeg spawn error, a bad container, or a missing frame
+                eprintln!(
+                    "[render] decode {media_ref_owned} @ frame {index}                      (t={:.3}s): {error}",
+                    index as f64 / source_fps
+                );
+                error
+            })
             .ok()
             .map(|(_, frame)| frame)
         };
