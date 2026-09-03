@@ -533,24 +533,6 @@ impl Drop for FrameDecodeStream {
     }
 }
 
-fn frame_args_for_input(
-    input: &str,
-    req: &FrameRequest,
-    color: Option<&opentake_domain::MediaColorMetadata>,
-) -> Vec<String> {
-    let mut args = frame_args_with_color(Path::new(input), req, color);
-    let seek_index = args
-        .iter()
-        .position(|argument| argument == "-ss")
-        .expect("frame args always contain seek");
-    let seek = args.drain(seek_index..seek_index + 2).collect::<Vec<_>>();
-    let input_index = args
-        .iter()
-        .position(|argument| argument == "-i")
-        .expect("frame args always contain input");
-    args.splice(input_index + 2..input_index + 2, seek);
-    args
-}
 
 /// Decode the frame at/after `req.time_secs`, returning `(actual_secs, frame)`.
 pub fn decode_frame_at(path: &Path, req: &FrameRequest) -> Result<(f64, RgbaFrame)> {
@@ -665,7 +647,11 @@ pub fn decode_frame_at_cancellable(
 }
 
 /// Decode from an already-open regular file. The retained handle is cloned,
-/// rewound, and becomes ffmpeg's stdin (`fd:`); no pathname fallback occurs.
+/// rewound, and attached as ffmpeg's SEEKABLE stdin (`fd:`) via a raw
+/// command — sidecar `spawn()` force-repipes stdin, and a non-seekable
+/// pipe with output-seek yields ZERO frames for HEVC (confirmed). Output
+/// is BMP (self-describing dimensions) decoded in-process, so scaling in
+/// the frame args needs no out-of-band width/height.
 pub fn decode_frame_file_at_cancellable(
     file: &std::fs::File,
     req: &FrameRequest,
@@ -679,104 +665,56 @@ pub fn decode_frame_file_at_cancellable(
         .and_then(|probe| probe.color);
     let mut input = file.try_clone()?;
     input.seek(SeekFrom::Start(0))?;
-    let mut child = ff::ffmpeg()
-        .args(frame_args_for_input("fd:", req, color.as_ref()))
-        .spawn()
-        .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
-    cancel.child_spawned();
-    let mut stdin = child
-        .take_stdin()
-        .ok_or_else(|| MediaError::Ffmpeg("retained frame stdin missing".to_string()))?;
-    let feeder = thread::Builder::new()
-        .name("opentake-retained-frame-input".to_string())
-        .spawn(move || std::io::copy(&mut input, &mut stdin))
-        .map_err(MediaError::Io)?;
-    let result = decode_first_child_frame(&mut child, req.time_secs, cancel);
-    match feeder.join() {
-        Ok(Ok(_)) => result,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => result,
-        Ok(Err(error)) => Err(MediaError::Io(error)),
-        Err(_) => Err(MediaError::Ffmpeg(
-            "retained frame input feeder panicked".to_string(),
-        )),
-    }
-}
 
-fn decode_first_child_frame(
-    child: &mut ffmpeg_sidecar::child::FfmpegChild,
-    requested_time: f64,
-    cancel: &MediaCancelToken,
-) -> Result<(f64, RgbaFrame)> {
-    let iter = match child.iter() {
-        Ok(iter) => iter,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(MediaError::Ffmpeg(format!("iter: {error}")));
-        }
-    };
-    let reader_cancel = cancel.clone();
-    let reader = match thread::Builder::new()
-        .name("opentake-retained-frame-events".to_string())
-        .spawn(move || {
-            reader_cancel.reader_started();
-            let result = iter
-                .filter_map(|event| match event {
-                    FfmpegEvent::OutputFrame(frame) if frame.width > 0 && frame.height > 0 => {
-                        Some((
-                            requested_time.max(frame.timestamp as f64),
-                            RgbaFrame::new(frame.width, frame.height, frame.data),
-                        ))
-                    }
-                    _ => None,
-                })
-                .next();
-            reader_cancel.reader_finished();
-            result
-        }) {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(MediaError::Ffmpeg(format!(
-                "spawn frame event reader: {error}"
-            )));
-        }
-    };
-    loop {
-        if cancel.checkpoint() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(MediaError::Cancelled);
-        }
-        if reader.is_finished() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let result = reader
-                .join()
-                .map_err(|_| MediaError::Ffmpeg("frame event reader panicked".to_string()))?;
-            return result
-                .ok_or_else(|| MediaError::Decode(format!("no frame at {requested_time:.3}s")));
-        }
-        match child.as_inner_mut().try_wait() {
-            Ok(Some(_)) => {
-                let result = reader
-                    .join()
-                    .map_err(|_| MediaError::Ffmpeg("frame event reader panicked".to_string()))?;
-                return result.ok_or_else(|| {
-                    MediaError::Decode(format!("no frame at {requested_time:.3}s"))
-                });
-            }
-            Ok(None) => thread::sleep(FRAME_CHILD_POLL_INTERVAL),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(MediaError::Io(error));
-            }
-        }
+    // `-ss` stays BEFORE `-i` (input seek) — the seekable fd makes it fast
+    // and correct; then one BMP frame to stdout.
+    let mut args = frame_args_with_color(Path::new("fd:"), req, color.as_ref());
+    // frame_args ends with the rawvideo sink; swap it for a BMP image pipe.
+    if let Some(pos) = args.iter().position(|a| a == "-f") {
+        args.truncate(pos);
     }
+    args.extend(
+        ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "bmp", "pipe:1"]
+            .into_iter()
+            .map(String::from),
+    );
+
+    let mut command = std::process::Command::new(ff::ffmpeg_path());
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::from(input))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    crate::process_tree::configure_command(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| MediaError::Ffmpeg(format!("retained spawn: {error}")))?;
+    cancel.child_spawned();
+
+    let mut bmp = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .ok_or_else(|| MediaError::Ffmpeg("retained stdout missing".to_string()))
+        .and_then(|mut out| {
+            std::io::Read::read_to_end(&mut out, &mut bmp).map_err(MediaError::Io)
+        });
+    let status = child.wait().map_err(MediaError::Io)?;
+    if cancel.is_cancelled() {
+        return Err(MediaError::Cancelled);
+    }
+    read?;
+    if !status.success() || bmp.is_empty() {
+        return Err(MediaError::Decode(format!(
+            "no frame at {:.3}s",
+            req.time_secs
+        )));
+    }
+    let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+        .map_err(|error| MediaError::Decode(format!("bmp decode: {error}")))?
+        .into_rgba8();
+    let (w, h) = (decoded.width(), decoded.height());
+    Ok((req.time_secs, RgbaFrame::new(w, h, decoded.into_raw())))
 }
 
 /// Decode one cancellable frame and encode it as PNG bytes without publishing
@@ -869,6 +807,42 @@ mod tests {
     use std::time::{Duration, Instant};
 
     // --- fit_within: pure scaling math ---
+
+    #[test]
+    fn retained_hevc_frame_decodes_through_seekable_fd() {
+        // HEVC via a non-seekable pipe with output-seek yields ZERO frames;
+        // the retained decoder must seek the fd and return a real frame.
+        if !crate::ff::ffmpeg_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("fixture dir");
+        let src = temp.path().join("hevc.mp4");
+        let ok = Command::new(crate::ff::ffmpeg_path())
+            .args([
+                "-v", "error", "-f", "lavfi", "-i",
+                "testsrc=size=320x240:rate=30:duration=3",
+                "-c:v", "libx265", "-pix_fmt", "yuv420p", "-y",
+            ])
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok || !src.exists() {
+            return; // no HEVC encoder in this environment — skip
+        }
+        let file = std::fs::File::open(&src).expect("open hevc fixture");
+        let req = FrameRequest {
+            time_secs: 1.966,
+            max_size: (256, 256),
+            tolerance_secs: 0.0,
+            apply_rotation: true,
+        };
+        let (_t, frame) =
+            decode_frame_file_at_cancellable(&file, &req, &MediaCancelToken::new())
+                .expect("retained HEVC decode must produce a frame");
+        assert!(frame.width > 0 && frame.height > 0);
+        assert_eq!(frame.rgba.len(), (frame.width * frame.height * 4) as usize);
+    }
 
     #[test]
     fn cancelling_frame_decode_with_no_iterator_events_kills_child_and_joins_reader() {
