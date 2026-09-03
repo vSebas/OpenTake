@@ -8340,6 +8340,7 @@ mod tests {
     #[test]
     fn import_media_rejects_model_supplied_paths_before_bridge_access() {
         let (d, bridge) = dispatcher_with_fake_bridge();
+        // nonexistent model paths: rejected at canonicalization, no leak
         for path in [
             "/Users/model/Pictures/private.png",
             "../../Pictures/private.png",
@@ -8349,15 +8350,66 @@ mod tests {
                 serde_json::json!({ "source": { "path": path }, "name": "Clip" }),
             );
             assert!(r.is_error, "model-supplied path unexpectedly imported");
-            assert!(r.text_joined().contains("authority"), "{}", r.text_joined());
             let safe = crate::mcp::convert::safe_tool_result_for_llm(&r);
-            assert_eq!(safe["code"], "MCP_PATH_AUTHORITY_REQUIRED");
             let safe_wire = safe.to_string();
-            assert!(!safe_wire.contains(path), "path leaked: {safe_wire}");
+            assert!(!safe_wire.contains("private.png"), "path leaked: {safe_wire}");
         }
+        // an EXISTING file outside any granted root: authority required,
+        // still no bridge access and no leak
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("private.mp4");
+        std::fs::write(&real, b"x").unwrap();
+        let grants = temp.path().join("grants-empty.txt");
+        std::fs::write(&grants, "# nothing granted\n").unwrap();
+        temp_env::with_var(
+            "OPENTAKE_MCP_GRANTED_PATHS_FILE",
+            Some(grants.as_os_str()),
+            || {
+                let r = d.dispatch(
+                    "import_media",
+                    serde_json::json!({
+                        "source": { "path": real.to_string_lossy() },
+                        "name": "Clip"
+                    }),
+                );
+                assert!(r.is_error, "ungranted existing path imported");
+                assert!(
+                    r.text_joined().contains("granted"),
+                    "{}",
+                    r.text_joined()
+                );
+                let safe = crate::mcp::convert::safe_tool_result_for_llm(&r);
+                assert_eq!(safe["code"], "MCP_PATH_AUTHORITY_REQUIRED");
+                assert!(
+                    !safe.to_string().contains("private.mp4"),
+                    "path leaked"
+                );
+            },
+        );
         assert!(
             bridge.import_calls.lock().unwrap().is_empty(),
             "path rejection must happen before the bridge can touch metadata"
+        );
+        // and WITH a user grant the very same path reaches the bridge
+        let grants_ok = temp.path().join("grants.txt");
+        std::fs::write(&grants_ok, format!("{}\n", temp.path().display()))
+            .unwrap();
+        temp_env::with_var(
+            "OPENTAKE_MCP_GRANTED_PATHS_FILE",
+            Some(grants_ok.as_os_str()),
+            || {
+                let _ = d.dispatch(
+                    "import_media",
+                    serde_json::json!({
+                        "source": { "path": real.to_string_lossy() },
+                        "name": "Clip"
+                    }),
+                );
+            },
+        );
+        assert!(
+            !bridge.import_calls.lock().unwrap().is_empty(),
+            "granted path must reach the bridge"
         );
     }
 
