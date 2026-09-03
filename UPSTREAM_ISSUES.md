@@ -81,3 +81,13 @@ seekable fd with `-ss` before `-i`. Deferred hardening (internal notes,
 fork-only): import publishes on ffprobe failure via ProbedMedia::default
 (should fail-closed); add_clips doesn't validate mediaRef existence/trim
 against the manifest; cover decoder collapses all errors to one string.
+
+## MCP orchestration end-to-end WORKING (fork, 2026-09-03)
+
+Vlog Studio now orchestrates OpenTake fully over external MCP: create/open
+the vlog's own project (new_project + lease-free lifecycle dispatch),
+auto-import missing footage under a user-granted path root, align canvas
+via set_project_settings, place the cut, save durably (save_project made
+lease-free — was self-deadlocking), and the GUI now NAVIGATES to the
+MCP-opened project (sync.ts convergence handler + setView, not a
+GUI-authority reopen). HEVC covers decode via seekable fd. Verified live.
