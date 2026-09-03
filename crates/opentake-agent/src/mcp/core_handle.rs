@@ -247,11 +247,25 @@ impl CoreHandle for AppCoreHandle {
     }
 
     fn new_project_bundle(&self, path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+        // Preserve the outgoing project (review finding 3): autosave it if
+        // it has a bundle, and on a failed create try to reopen it so the
+        // GUI is not stranded on an unsaved empty project. A prior UNSAVED
+        // scratch is still lost — documented limitation until the core
+        // grows an off-session bundle constructor.
+        let previous = self.0.runtime_snapshot().project_dir;
+        if previous.is_some() {
+            let _ = self.0.save_project(None);
+        }
         let snapshot = self.0.new_project();
-        self.0
-            .save_project(Some(path.to_path_buf()))
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        Ok((snapshot.project_epoch, snapshot.version))
+        match self.0.save_project(Some(path.to_path_buf())) {
+            Ok(_) => Ok((snapshot.project_epoch, snapshot.version)),
+            Err(error) => {
+                if let Some(prev) = previous {
+                    let _ = self.0.open_project(&prev);
+                }
+                Err(anyhow::anyhow!("{error}"))
+            }
+        }
     }
 
     fn save_open_project(&self) -> anyhow::Result<PathBuf> {

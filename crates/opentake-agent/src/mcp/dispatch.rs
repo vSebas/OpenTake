@@ -743,11 +743,7 @@ impl Dispatcher {
             ToolName::OpenProject => {
                 let a: OpenProjectArgs = decode_tool_args(args, "")?;
                 let name = a.name.trim();
-                if name.is_empty()
-                    || name.contains('/')
-                    || name.contains('\\')
-                    || name.contains("..")
-                {
+                if !valid_bundle_name(name) {
                     return Err(ToolError::new(
                         "open_project: name must be a plain bundle name from \
                          list_projects (no paths)",
@@ -795,11 +791,7 @@ impl Dispatcher {
             ToolName::NewProject => {
                 let a: NewProjectArgs = decode_tool_args(args, "")?;
                 let name = a.name.trim();
-                if name.is_empty()
-                    || name.contains('/')
-                    || name.contains('\\')
-                    || name.contains("..")
-                {
+                if !valid_bundle_name(name) {
                     return Err(ToolError::new(
                         "new_project: name must be a plain bundle name (no paths)",
                     ));
@@ -3163,6 +3155,23 @@ fn insert_after_summary(result: &mut ToolResult, block: Block) {
     result.content.insert(index, block);
 }
 
+
+/// A bundle name must be exactly one normal path component — separators,
+/// parent refs, roots, and Windows drive/UNC prefixes are all rejected so
+/// `root.join(name)` can never escape the projects directory.
+fn valid_bundle_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() {
+        return false;
+    }
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !name.contains(':')
+        && !name.contains('\\')
+}
+
 fn insert_timeline_result_warning(result: &mut ToolResult) {
     insert_after_summary(result, Block::text(TIMELINE_RESULT_WARNING));
 }
@@ -4860,6 +4869,19 @@ fn round_floats_3dp(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundle_names_reject_traversal_and_windows_prefixes() {
+        assert!(super::valid_bundle_name("mi-vlog"));
+        assert!(super::valid_bundle_name("9-12-abril.opentake"));
+        assert!(!super::valid_bundle_name(""));
+        assert!(!super::valid_bundle_name("a/b"));
+        assert!(!super::valid_bundle_name("a\\b"));
+        assert!(!super::valid_bundle_name(".."));
+        assert!(!super::valid_bundle_name("../escape"));
+        assert!(!super::valid_bundle_name("C:outside"));
+        assert!(!super::valid_bundle_name("/abs"));
+    }
+
     use super::*;
     use opentake_core::AppCore;
     use opentake_domain::{ClipType, MediaManifestEntry, MediaSource, Track};

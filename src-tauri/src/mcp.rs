@@ -583,6 +583,42 @@ fn changes_project_identity(name: &str) -> bool {
     matches!(name, "open_project" | "new_project")
 }
 
+
+impl LiveProjectMcpGate {
+    /// Dedicated path for tools whose PURPOSE is replacing the project
+    /// identity. They must not hold the identity read lease (the core
+    /// takes that lock exclusively — review BLOCKER 1) and must not be
+    /// registered for transition cancellation (their own announcement
+    /// would cancel them — review BLOCKER 2). Concurrent non-lifecycle
+    /// dispatches are still cancelled by the transition, as before.
+    fn dispatch_lifecycle(
+        &self,
+        dispatcher: &Dispatcher,
+        undo_scope: Option<&str>,
+        name: &str,
+        args: serde_json::Value,
+        request_cancel: &opentake_media::MediaCancelToken,
+    ) -> Option<ToolResult> {
+        if self.transition_pending() || request_cancel.is_cancelled() {
+            return None;
+        }
+        let receipt = match undo_scope {
+            Some(scope) => dispatcher.dispatch_cancellable_scoped_deferred(
+                scope, name, args, request_cancel,
+            ),
+            None => dispatcher.dispatch_cancellable_deferred(
+                name, args, request_cancel,
+            ),
+        };
+        let result = dispatcher.finish_dispatch(receipt, request_cancel);
+        // The tool result is authoritative: on success the identity HAS
+        // changed (that is the contract). A GUI switch racing the
+        // post-capture window is reflected by the caller's next
+        // get_timeline — returning the completed result is correct.
+        Some(result)
+    }
+}
+
 impl ChatTurnGate for LiveProjectMcpGate {
     fn timeline(&self, dispatcher: &Dispatcher) -> Option<opentake_domain::Timeline> {
         self.with_live_project(|| dispatcher.timeline())
@@ -605,10 +641,15 @@ impl ChatTurnGate for LiveProjectMcpGate {
         args: serde_json::Value,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
+        if changes_project_identity(name) {
+            return self.dispatch_lifecycle(
+                dispatcher, None, name, args, request_cancel,
+            );
+        }
         let (expected_epoch, expected_dir, receipt) = self
             .with_live_dispatch_for(
                 request_cancel,
-                changes_project_identity(name),
+                false,
                 || {
                     let snapshot = self.core.runtime_snapshot();
                     (
@@ -623,12 +664,6 @@ impl ChatTurnGate for LiveProjectMcpGate {
         // GPU work happens after `with_live_dispatch` releases the project
         // identity workflow read lease.
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
-        if changes_project_identity(name) {
-            if request_cancel.is_cancelled() {
-                return None;
-            }
-            return Some(result);
-        }
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir
@@ -648,10 +683,15 @@ impl ChatTurnGate for LiveProjectMcpGate {
         undo_scope: &str,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
+        if changes_project_identity(name) {
+            return self.dispatch_lifecycle(
+                dispatcher, Some(undo_scope), name, args, request_cancel,
+            );
+        }
         let (expected_epoch, expected_dir, receipt) = self
             .with_live_dispatch_for(
                 request_cancel,
-                changes_project_identity(name),
+                false,
                 || {
                     let snapshot = self.core.runtime_snapshot();
                     (
@@ -667,12 +707,6 @@ impl ChatTurnGate for LiveProjectMcpGate {
                 },
             )?;
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
-        if changes_project_identity(name) {
-            if request_cancel.is_cancelled() {
-                return None;
-            }
-            return Some(result);
-        }
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir

@@ -905,6 +905,14 @@ impl ChatTurnGate for ProjectTurnGate {
         name: &str,
         args: serde_json::Value,
     ) -> Option<ToolResult> {
+        if matches!(name, "open_project" | "new_project") {
+            // A project-bound chat turn IS its project: switching identity
+            // mid-turn would deadlock on the identity lease and invalidate
+            // chat persistence. Refuse cleanly instead (review finding 4).
+            return Some(ToolResult::error(format!(
+                "{name}: not available inside a project chat turn — use the                  external MCP connection to switch or create projects"
+            )));
+        }
         let receipt = self.with_current_project(|| {
             dispatcher.dispatch_cancellable_scoped_deferred(
                 &self.undo_scope,
