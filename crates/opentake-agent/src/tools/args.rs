@@ -63,6 +63,16 @@ impl ToolArgs for NewProjectArgs {
     const ALLOWED_KEYS: &'static [&'static str] = &["name"];
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SetProjectSettingsArgs {
+    pub fps: i32,
+    pub width: i32,
+    pub height: i32,
+}
+impl ToolArgs for SetProjectSettingsArgs {
+    const ALLOWED_KEYS: &'static [&'static str] = &["fps", "width", "height"];
+}
+
 // --- add_track ---
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

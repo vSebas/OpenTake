@@ -214,6 +214,7 @@ pub(crate) fn dispatch_admission_class(name: &str, args: &Value) -> DispatchAdmi
         | ToolName::OpenProject
         | ToolName::SaveProject
         | ToolName::NewProject
+        | ToolName::SetProjectSettings
         | ToolName::AddTrack
         | ToolName::CloneVoice => DispatchAdmissionClass::Mutation,
     }
@@ -845,6 +846,20 @@ impl Dispatcher {
             ToolName::InspectMedia => self.inspect_media(args, before, manifest),
 
             // --- Editing (wired to EditCommand) ---
+            ToolName::SetProjectSettings => {
+                let a: SetProjectSettingsArgs = decode_tool_args(args, "")?;
+                self.apply(EditCommand::SetTimelineSettings {
+                    fps: a.fps,
+                    width: a.width,
+                    height: a.height,
+                })?;
+                Ok(ToolResult::ok(
+                    serde_json::json!({
+                        "fps": a.fps, "width": a.width, "height": a.height,
+                    })
+                    .to_string(),
+                ))
+            }
             ToolName::AddTrack => {
                 let a: AddTrackArgs = decode_tool_args(args, "")?;
                 let kind = match a.r#type.as_str() {
@@ -3280,6 +3295,7 @@ fn validate_tool_args(tool: ToolName, args: &Value) -> Result<(), ToolError> {
         ToolName::ListModels => decode!(ListModelsArgs),
         ToolName::OpenProject => decode!(OpenProjectArgs),
         ToolName::NewProject => decode!(NewProjectArgs),
+        ToolName::SetProjectSettings => decode!(SetProjectSettingsArgs),
         ToolName::AddTrack => decode!(AddTrackArgs),
         ToolName::AddClips => {
             decode!(AddClipsArgs);

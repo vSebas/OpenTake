@@ -97,6 +97,8 @@ pub fn description(tool: ToolName) -> &'static str {
 
         ToolName::NewProject => "Create a NEW empty project bundle named {name} in the projects folder and open it, REPLACING the timeline the GUI currently shows (unsaved changes in the current project are lost — call save_project first if they matter). Fails if a bundle with that name already exists (use open_project) or when the projects folder is unknown (open any saved project once). Returns the new project's identity (projectEpoch, timelineVersion).",
 
+        ToolName::SetProjectSettings => "Set the project's canvas and frame rate (width x height @ fps) — what the GUI's project settings dialog does, as one undoable edit. Fails when existing clips cannot be reprojected onto the new frame grid; safest on an empty or freshly created project.",
+
         ToolName::ListModels => "Lists AI models with their capabilities (durations, aspect ratios, resolutions, first/last frame support, reference support, voices/category for audio, upscaler speed). Always call before generate_video, generate_image, generate_audio, or upscale_media so the model you pick actually supports the constraints you need. Returns { models, loaded } — if loaded=false the catalog hasn't synced yet (e.g. user not signed in); the models array may be empty even when models exist, so do not conclude no models are available. Retry after the user signs in.",
 
         // --- OpenTake workflow-plugin tools (agent-SPEC §7.4; OpenTake-authored, styled to match upstream) ---
@@ -656,6 +658,15 @@ pub fn input_schema(tool: ToolName) -> Value {
                 "name": {"type": "string", "description": "Plain bundle name to create (no paths); '.opentake' is appended automatically."}
             }),
             &["name"],
+        ),
+
+        ToolName::SetProjectSettings => object(
+            json!({
+                "fps": {"type": "integer", "minimum": 1},
+                "width": {"type": "integer", "minimum": 16},
+                "height": {"type": "integer", "minimum": 16}
+            }),
+            &["fps", "width", "height"],
         ),
 
         ToolName::ActivateWorkflow => object(
