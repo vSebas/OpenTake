@@ -52,3 +52,18 @@ modify one clip and two changed, with no indication in the response. Either
 refusing divergence explicitly or reporting the propagated change would be
 honest; silent partner mutation is neither. (Fork batch 2 replaces this
 behavior with explicit link-divergence semantics for J/L cuts.)
+
+## MCP lifecycle tools vs the identity guards (fork, 2026-09-03)
+
+The external-MCP LiveProjectMcpGate cancelled any tool whose execution
+changed the project identity — making open_project (and the fork-added
+new_project) non-functional over MCP, and (once exempted naively) a
+self-deadlock: the gate holds the identity read lease while the tool
+takes the same lock exclusively. Fixed in the fork with a dedicated
+lifecycle dispatch path (no lease, no cancellable registration) plus a
+clean refusal in the in-app chat's ProjectTurnGate. Documented residual
+limitations (internal notes, NOT for upstream filing per fork-only
+policy): new_project loses a prior UNSAVED scratch (rollback reopens a
+saved predecessor only); bundle-exists check is TOCTOU against
+OTHER-process creators; a GUI project switch racing the post-dispatch
+capture window can make the returned result stale by one identity.
