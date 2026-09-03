@@ -588,7 +588,11 @@ fn changes_project_identity(name: &str) -> bool {
 /// must work from an unsaved scratch (the gate's project_dir admission
 /// would cancel it before its handler could answer).
 fn bypasses_identity_gate(name: &str) -> bool {
-    changes_project_identity(name) || name == "list_projects"
+    changes_project_identity(name)
+        || name == "list_projects"
+        // save_project takes the identity WRITE lock internally; running it
+        // under the gate's read lease self-deadlocks (Codex review).
+        || name == "save_project"
 }
 
 

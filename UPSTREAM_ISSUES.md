@@ -67,3 +67,17 @@ policy): new_project loses a prior UNSAVED scratch (rollback reopens a
 saved predecessor only); bundle-exists check is TOCTOU against
 OTHER-process creators; a GUI project switch racing the post-dispatch
 capture window can make the returned result stale by one identity.
+
+## MCP placement persistence + cover decode (fork, 2026-09-03)
+
+Codex pipeline review found the "0 clips persist" root cause: MCP
+save_project took the identity WRITE lock while the LiveProjectMcpGate
+held the identity READ lease → self-deadlock → 60s timeout. Fixed by
+routing save_project through the lease-free lifecycle path (like
+open/new/list). Also fixed: retained-file frame decode fed ffmpeg a
+non-seekable pipe with `-ss` after `-i` (decode-from-start), blowing the
+15s cover deadline → "decode failed"; now attaches the cloned file as a
+seekable fd with `-ss` before `-i`. Deferred hardening (internal notes,
+fork-only): import publishes on ffprobe failure via ProbedMedia::default
+(should fail-closed); add_clips doesn't validate mediaRef existence/trim
+against the manifest; cover decoder collapses all errors to one string.

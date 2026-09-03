@@ -533,24 +533,6 @@ impl Drop for FrameDecodeStream {
     }
 }
 
-fn frame_args_for_input(
-    input: &str,
-    req: &FrameRequest,
-    color: Option<&opentake_domain::MediaColorMetadata>,
-) -> Vec<String> {
-    let mut args = frame_args_with_color(Path::new(input), req, color);
-    let seek_index = args
-        .iter()
-        .position(|argument| argument == "-ss")
-        .expect("frame args always contain seek");
-    let seek = args.drain(seek_index..seek_index + 2).collect::<Vec<_>>();
-    let input_index = args
-        .iter()
-        .position(|argument| argument == "-i")
-        .expect("frame args always contain input");
-    args.splice(input_index + 2..input_index + 2, seek);
-    args
-}
 
 /// Decode the frame at/after `req.time_secs`, returning `(actual_secs, frame)`.
 pub fn decode_frame_at(path: &Path, req: &FrameRequest) -> Result<(f64, RgbaFrame)> {
@@ -679,27 +661,22 @@ pub fn decode_frame_file_at_cancellable(
         .and_then(|probe| probe.color);
     let mut input = file.try_clone()?;
     input.seek(SeekFrom::Start(0))?;
-    let mut child = ff::ffmpeg()
-        .args(frame_args_for_input("fd:", req, color.as_ref()))
+    // Attach the cloned regular file as a SEEKABLE stdin (fd:), so ffmpeg
+    // can input-seek it. The former feeder-pipe made fd: a pipe, which
+    // forced `-ss` after `-i` (decode from frame 0) and blew the cover
+    // deadline on expensive/late-trim sources — reported as "decode
+    // failed" (Codex review). frame_args_with_color keeps `-ss` BEFORE
+    // `-i` for the fast input seek.
+    let mut command = ff::ffmpeg();
+    command.args(frame_args_with_color(Path::new("fd:"), req, color.as_ref()));
+    command
+        .as_inner_mut()
+        .stdin(std::process::Stdio::from(input));
+    let mut child = command
         .spawn()
         .map_err(|error| MediaError::Ffmpeg(format!("spawn: {error}")))?;
     cancel.child_spawned();
-    let mut stdin = child
-        .take_stdin()
-        .ok_or_else(|| MediaError::Ffmpeg("retained frame stdin missing".to_string()))?;
-    let feeder = thread::Builder::new()
-        .name("opentake-retained-frame-input".to_string())
-        .spawn(move || std::io::copy(&mut input, &mut stdin))
-        .map_err(MediaError::Io)?;
-    let result = decode_first_child_frame(&mut child, req.time_secs, cancel);
-    match feeder.join() {
-        Ok(Ok(_)) => result,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => result,
-        Ok(Err(error)) => Err(MediaError::Io(error)),
-        Err(_) => Err(MediaError::Ffmpeg(
-            "retained frame input feeder panicked".to_string(),
-        )),
-    }
+    decode_first_child_frame(&mut child, req.time_secs, cancel)
 }
 
 fn decode_first_child_frame(
