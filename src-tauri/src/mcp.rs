@@ -501,7 +501,18 @@ impl LiveProjectMcpGate {
         cancel: &opentake_media::MediaCancelToken,
         operation: impl FnOnce() -> T,
     ) -> Option<T> {
-        self.with_live_dispatch_inner(cancel, || {}, operation)
+        self.with_live_dispatch_inner(cancel, false, || {}, operation)
+    }
+
+    fn with_live_dispatch_for<T>(
+        &self,
+        cancel: &opentake_media::MediaCancelToken,
+        identity_change_expected: bool,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.with_live_dispatch_inner(
+            cancel, identity_change_expected, || {}, operation,
+        )
     }
 
     #[cfg(test)]
@@ -511,12 +522,13 @@ impl LiveProjectMcpGate {
         after_admission: impl FnOnce(),
         operation: impl FnOnce() -> T,
     ) -> Option<T> {
-        self.with_live_dispatch_inner(cancel, after_admission, operation)
+        self.with_live_dispatch_inner(cancel, false, after_admission, operation)
     }
 
     fn with_live_dispatch_inner<T>(
         &self,
         cancel: &opentake_media::MediaCancelToken,
+        identity_change_expected: bool,
         after_admission: impl FnOnce(),
         operation: impl FnOnce() -> T,
     ) -> Option<T> {
@@ -536,12 +548,22 @@ impl LiveProjectMcpGate {
             return None;
         }
         let expected = self.core.runtime_snapshot();
-        expected.project_dir.as_ref()?;
+        if !identity_change_expected {
+            // lifecycle tools may run from an unsaved scratch project —
+            // their handlers give a precise error when the projects
+            // folder is unknown, which beats a generic cancelled turn
+            expected.project_dir.as_ref()?;
+        }
         let _permit = self.register_dispatch(cancel)?;
         if self.transition_pending() || cancel.is_cancelled() {
             return None;
         }
         let result = operation();
+        if identity_change_expected {
+            // open_project/new_project REPLACE the identity on success —
+            // that is their contract, not a cancelled turn
+            return Some(result);
+        }
         let current = self.core.runtime_snapshot();
         if current.project_epoch != expected.project_epoch
             || current.project_dir != expected.project_dir
@@ -583,15 +605,21 @@ impl ChatTurnGate for LiveProjectMcpGate {
         args: serde_json::Value,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        let (expected_epoch, expected_dir, receipt) =
-            self.with_live_dispatch(request_cancel, || {
-                let snapshot = self.core.runtime_snapshot();
-                (
-                    snapshot.project_epoch,
-                    snapshot.project_dir,
-                    dispatcher.dispatch_cancellable_deferred(name, args, request_cancel),
-                )
-            })?;
+        let (expected_epoch, expected_dir, receipt) = self
+            .with_live_dispatch_for(
+                request_cancel,
+                changes_project_identity(name),
+                || {
+                    let snapshot = self.core.runtime_snapshot();
+                    (
+                        snapshot.project_epoch,
+                        snapshot.project_dir,
+                        dispatcher.dispatch_cancellable_deferred(
+                            name, args, request_cancel,
+                        ),
+                    )
+                },
+            )?;
         // GPU work happens after `with_live_dispatch` releases the project
         // identity workflow read lease.
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
@@ -620,20 +648,24 @@ impl ChatTurnGate for LiveProjectMcpGate {
         undo_scope: &str,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        let (expected_epoch, expected_dir, receipt) =
-            self.with_live_dispatch(request_cancel, || {
-                let snapshot = self.core.runtime_snapshot();
-                (
-                    snapshot.project_epoch,
-                    snapshot.project_dir,
-                    dispatcher.dispatch_cancellable_scoped_deferred(
-                        undo_scope,
-                        name,
-                        args,
-                        request_cancel,
-                    ),
-                )
-            })?;
+        let (expected_epoch, expected_dir, receipt) = self
+            .with_live_dispatch_for(
+                request_cancel,
+                changes_project_identity(name),
+                || {
+                    let snapshot = self.core.runtime_snapshot();
+                    (
+                        snapshot.project_epoch,
+                        snapshot.project_dir,
+                        dispatcher.dispatch_cancellable_scoped_deferred(
+                            undo_scope,
+                            name,
+                            args,
+                            request_cancel,
+                        ),
+                    )
+                },
+            )?;
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
         if changes_project_identity(name) {
             if request_cancel.is_cancelled() {
