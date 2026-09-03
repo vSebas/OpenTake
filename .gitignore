@@ -30,4 +30,3 @@ Thumbs.db
 # Project bundles created by the GUI/MCP default location (~/Documents/OpenTake)
 # — personal vlog data must never enter this public repo
 *.opentake/
-!test.opentake/
