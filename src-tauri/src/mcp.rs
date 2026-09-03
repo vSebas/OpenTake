@@ -553,6 +553,14 @@ impl LiveProjectMcpGate {
     }
 }
 
+
+/// Lifecycle tools whose entire purpose is to REPLACE the project identity —
+/// the identity-unchanged post-check must not treat their success as a
+/// cancelled turn (it made open_project/new_project always fail over MCP).
+fn changes_project_identity(name: &str) -> bool {
+    matches!(name, "open_project" | "new_project")
+}
+
 impl ChatTurnGate for LiveProjectMcpGate {
     fn timeline(&self, dispatcher: &Dispatcher) -> Option<opentake_domain::Timeline> {
         self.with_live_project(|| dispatcher.timeline())
@@ -587,6 +595,12 @@ impl ChatTurnGate for LiveProjectMcpGate {
         // GPU work happens after `with_live_dispatch` releases the project
         // identity workflow read lease.
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
+        if changes_project_identity(name) {
+            if request_cancel.is_cancelled() {
+                return None;
+            }
+            return Some(result);
+        }
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir
@@ -621,6 +635,12 @@ impl ChatTurnGate for LiveProjectMcpGate {
                 )
             })?;
         let result = dispatcher.finish_dispatch(receipt, request_cancel);
+        if changes_project_identity(name) {
+            if request_cancel.is_cancelled() {
+                return None;
+            }
+            return Some(result);
+        }
         let still_current = self.with_live_project(|| {
             let snapshot = self.core.runtime_snapshot();
             snapshot.project_epoch == expected_epoch && snapshot.project_dir == expected_dir
