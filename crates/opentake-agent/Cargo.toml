@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Tool layer (= ToolExecutor) + MCP server (rmcp) + in-app chat client + short-id + system prompts."
 
 [dependencies]
+dirs = "6"
 opentake-domain = { workspace = true }
 opentake-ops = { workspace = true }
 opentake-core = { workspace = true }

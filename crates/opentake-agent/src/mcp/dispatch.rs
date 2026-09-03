@@ -715,8 +715,19 @@ impl Dispatcher {
                 })?;
                 let open_bundle = self.handle.project_dir();
                 let mut names: Vec<serde_json::Value> = Vec::new();
-                let entries = std::fs::read_dir(&root)
-                    .map_err(|e| ToolError::new(format!("list_projects: {e}")))?;
+                let entries = match std::fs::read_dir(&root) {
+                    Ok(entries) => entries,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // fallback root that has never been created yet —
+                        // an empty library, not an error
+                        return Ok(ToolResult::ok(
+                            serde_json::json!({ "projects": [] }).to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(ToolError::new(format!("list_projects: {e}")))
+                    }
+                };
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let is_bundle = path.is_dir()
@@ -811,6 +822,11 @@ impl Dispatcher {
                     return Err(ToolError::new(format!(
                         "new_project: a bundle named {name:?} already exists — \
                          use open_project"
+                    )));
+                }
+                if let Err(e) = std::fs::create_dir_all(&root) {
+                    return Err(ToolError::new(format!(
+                        "new_project: cannot create projects folder: {e}"
                     )));
                 }
                 let (project_epoch, timeline_version) = self

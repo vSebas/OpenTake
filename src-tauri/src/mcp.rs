@@ -583,6 +583,14 @@ fn changes_project_identity(name: &str) -> bool {
     matches!(name, "open_project" | "new_project")
 }
 
+/// Tools that must bypass the identity gate entirely: the two
+/// identity-changers plus list_projects — a pure filesystem read that
+/// must work from an unsaved scratch (the gate's project_dir admission
+/// would cancel it before its handler could answer).
+fn bypasses_identity_gate(name: &str) -> bool {
+    changes_project_identity(name) || name == "list_projects"
+}
+
 
 impl LiveProjectMcpGate {
     /// Dedicated path for tools whose PURPOSE is replacing the project
@@ -641,7 +649,7 @@ impl ChatTurnGate for LiveProjectMcpGate {
         args: serde_json::Value,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        if changes_project_identity(name) {
+        if bypasses_identity_gate(name) {
             return self.dispatch_lifecycle(
                 dispatcher, None, name, args, request_cancel,
             );
@@ -683,7 +691,7 @@ impl ChatTurnGate for LiveProjectMcpGate {
         undo_scope: &str,
         request_cancel: &opentake_media::MediaCancelToken,
     ) -> Option<ToolResult> {
-        if changes_project_identity(name) {
+        if bypasses_identity_gate(name) {
             return self.dispatch_lifecycle(
                 dispatcher, Some(undo_scope), name, args, request_cancel,
             );

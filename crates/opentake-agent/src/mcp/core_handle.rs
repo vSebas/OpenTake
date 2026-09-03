@@ -238,6 +238,15 @@ impl CoreHandle for AppCoreHandle {
         true
     }
 
+    fn projects_root(&self) -> Option<PathBuf> {
+        // Prefer the open bundle's parent; fall back to the GUI's own
+        // default save location (~/Documents/OpenTake) so lifecycle tools
+        // work from a fresh unsaved scratch instead of dead-ending.
+        self.project_dir()
+            .and_then(|dir| dir.parent().map(std::path::Path::to_path_buf))
+            .or_else(|| dirs::document_dir().map(|d| d.join("OpenTake")))
+    }
+
     fn open_project_bundle(&self, path: &std::path::Path) -> anyhow::Result<(u64, u64)> {
         let snapshot = self
             .0
