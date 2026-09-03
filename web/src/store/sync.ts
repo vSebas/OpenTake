@@ -383,7 +383,7 @@ export async function startSync(): Promise<void> {
     }
     unlistenTimeline = timelineUnlisten;
 
-    const openedUnlisten = await api.onProjectOpened(async (_path, projectEpoch, version) => {
+    const openedUnlisten = await api.onProjectOpened(async (path, projectEpoch, version) => {
       if (!lifecycleActive()) return;
       if (projectEpoch < useProjectStore.getState().projectEpoch) return;
       try {
@@ -403,6 +403,18 @@ export async function startSync(): Promise<void> {
         "项目切换同步失败 / Project transition sync failed",
       );
       await requestLifecycleConvergence(generation, lifecycleActive);
+      // A project opened OUTSIDE the GUI (Vlog Studio placing a cut over
+      // MCP) refreshes the store here but never navigated the window.
+      // Navigate to the editor once converged, only if the store still
+      // reflects THIS open (guards against a newer open racing ahead).
+      const store = useProjectStore.getState();
+      if (
+        lifecycleActive() &&
+        store.projectEpoch === projectEpoch &&
+        (!path || store.projectPath === path)
+      ) {
+        useEditorUiStore.getState().setView("editor");
+      }
     });
     if (!lifecycleActive()) {
       openedUnlisten();
