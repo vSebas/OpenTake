@@ -26,3 +26,8 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Project bundles created by the GUI/MCP default location (~/Documents/OpenTake)
+# — personal vlog data must never enter this public repo
+*.opentake/
+!test.opentake/
