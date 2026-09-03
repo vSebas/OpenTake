@@ -1321,14 +1321,36 @@ impl Dispatcher {
             ));
         }
 
-        // LLM/MCP input is never file-system authority. Until the desktop host
-        // injects a picker-issued, persistent scope capability, a path supplied
-        // in a prompt must fail before the media bridge can inspect metadata.
-        if source.path.is_some() {
-            return Ok(ToolResult::public_error(
-                PublicErrorKind::PathAuthorityRequired(ToolName::ImportMedia),
-                "source.path: explicit user-granted file authority is required",
-            ));
+        // LLM/MCP input is never file-system authority. A path is admitted
+        // only when it canonicalizes INSIDE a root the USER granted
+        // out-of-band in mcp-granted-paths.txt — the persistent scope
+        // capability this guard was originally waiting for. Symlinks are
+        // resolved before the check, so links escaping a granted root
+        // stay blocked.
+        let mut granted_path: Option<String> = None;
+        if let Some(raw_path) = source.path.as_deref() {
+            let canonical = match std::fs::canonicalize(raw_path) {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    return Ok(ToolResult::public_error(
+                        PublicErrorKind::InvalidArguments(ToolName::ImportMedia),
+                        format!("source.path: {e}"),
+                    ));
+                }
+            };
+            let allowed = granted_path_roots()
+                .iter()
+                .any(|root| canonical.starts_with(root));
+            if !allowed {
+                return Ok(ToolResult::public_error(
+                    PublicErrorKind::PathAuthorityRequired(ToolName::ImportMedia),
+                    "source.path: not under a user-granted root — a human can \
+                     grant a folder by adding its absolute path as a line in \
+                     opentake/mcp-granted-paths.txt inside the OS config \
+                     directory, then retry",
+                ));
+            }
+            granted_path = Some(canonical.to_string_lossy().into_owned());
         }
 
         // folderId, when provided, must name an existing folder (upstream
@@ -1342,7 +1364,9 @@ impl Dispatcher {
             }
         }
 
-        let import_source = if let Some(base64) = source.bytes.clone() {
+        let import_source = if let Some(path) = granted_path {
+            ImportSource::Path(path)
+        } else if let Some(base64) = source.bytes.clone() {
             let base64_len = base64.trim().len();
             if base64_len > IMPORT_BYTES_BASE64_MAX {
                 return Ok(ToolResult::public_error(
@@ -3175,6 +3199,28 @@ fn insert_after_summary(result: &mut ToolResult, block: Block) {
 /// A bundle name must be exactly one normal path component — separators,
 /// parent refs, roots, and Windows drive/UNC prefixes are all rejected so
 /// `root.join(name)` can never escape the projects directory.
+
+/// User-granted filesystem roots for `import_media` path sources. Authority
+/// comes ONLY from a config file the human edits out-of-band (or the
+/// `OPENTAKE_MCP_GRANTED_PATHS_FILE` override for tests) — never from model
+/// input. Each non-empty, non-comment line is one directory root.
+fn granted_path_roots() -> Vec<std::path::PathBuf> {
+    let file = std::env::var_os("OPENTAKE_MCP_GRANTED_PATHS_FILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            dirs::config_dir().map(|d| d.join("opentake").join("mcp-granted-paths.txt"))
+        });
+    let Some(file) = file else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| std::fs::canonicalize(line).ok())
+        .collect()
+}
+
 fn valid_bundle_name(name: &str) -> bool {
     use std::path::Component;
     if name.is_empty() {
@@ -4885,6 +4931,43 @@ fn round_floats_3dp(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn granted_path_roots_come_only_from_the_grants_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inside = temp.path().join("footage");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("clip.mp4"), b"x").unwrap();
+        let outside = temp.path().join("secrets");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("key.mp4"), b"x").unwrap();
+        let grants = temp.path().join("grants.txt");
+        std::fs::write(&grants, format!("# comment\n{}\n", inside.display()))
+            .unwrap();
+        temp_env::with_var(
+            "OPENTAKE_MCP_GRANTED_PATHS_FILE",
+            Some(grants.as_os_str()),
+            || {
+                let roots = super::granted_path_roots();
+                assert_eq!(roots.len(), 1);
+                let canon_in =
+                    std::fs::canonicalize(inside.join("clip.mp4")).unwrap();
+                assert!(roots.iter().any(|r| canon_in.starts_with(r)));
+                let canon_out =
+                    std::fs::canonicalize(outside.join("key.mp4")).unwrap();
+                assert!(!roots.iter().any(|r| canon_out.starts_with(r)));
+                // a symlink inside the granted root pointing outside must
+                // canonicalize OUTSIDE and stay blocked
+                let link = inside.join("sneaky.mp4");
+                let _ = std::os::unix::fs::symlink(
+                    outside.join("key.mp4"),
+                    &link,
+                );
+                let canon_link = std::fs::canonicalize(&link).unwrap();
+                assert!(!roots.iter().any(|r| canon_link.starts_with(r)));
+            },
+        );
+    }
+
     #[test]
     fn bundle_names_reject_traversal_and_windows_prefixes() {
         assert!(super::valid_bundle_name("mi-vlog"));
