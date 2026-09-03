@@ -826,7 +826,19 @@ fn authorize_composite_sources<R: tauri::Runtime>(
         let retained = match &entry.source {
             opentake_domain::MediaSource::External { absolute_path } => {
                 let requested = std::path::Path::new(absolute_path);
-                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, requested) {
+                // A source is authorized for cover capture if the GUI's
+                // asset scope allows it OR it lies under a user-granted MCP
+                // root — the same allowlist that admitted the import. Both
+                // the requested path and its canonical form are checked.
+                let granted_roots = opentake_agent::mcp::dispatch::granted_path_roots();
+                let under_grant = |p: &std::path::Path| {
+                    std::fs::canonicalize(p).map_or(false, |c| {
+                        granted_roots.iter().any(|root| c.starts_with(root))
+                    })
+                };
+                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, requested)
+                    && !under_grant(requested)
+                {
                     continue;
                 }
                 let Ok((file, final_path)) =
@@ -834,7 +846,9 @@ fn authorize_composite_sources<R: tauri::Runtime>(
                 else {
                     continue;
                 };
-                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, &final_path) {
+                if !crate::safe_asset_protocol::scope_allows_lexical_path(&scope, &final_path)
+                    && !under_grant(&final_path)
+                {
                     continue;
                 }
                 file

@@ -3219,7 +3219,7 @@ fn insert_after_summary(result: &mut ToolResult, block: Block) {
 /// comes ONLY from a config file the human edits out-of-band (or the
 /// `OPENTAKE_MCP_GRANTED_PATHS_FILE` override for tests) — never from model
 /// input. Each non-empty, non-comment line is one directory root.
-fn granted_path_roots() -> Vec<std::path::PathBuf> {
+pub fn granted_path_roots() -> Vec<std::path::PathBuf> {
     let file = std::env::var_os("OPENTAKE_MCP_GRANTED_PATHS_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
