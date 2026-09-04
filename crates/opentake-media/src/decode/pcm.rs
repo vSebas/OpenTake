@@ -435,8 +435,20 @@ pub(super) fn decode_raw_pcm_cancellable(
     let frame_bytes = usize::from(spec.channels)
         .checked_mul(spec.format.bytes_per_sample())
         .ok_or_else(|| audio_buffer_too_large("PCM frame byte count overflow"))?;
+    // FFmpeg's decoded PCM length routinely exceeds the container-duration
+    // estimate by codec priming/delay (AAC adds ~1-2k samples, common on iPhone
+    // footage), resampler flush, and duration-metadata rounding. This cap bounds
+    // memory against a runaway/corrupt stream, NOT sample-exactness, so give it a
+    // generous margin — ~1 second of audio or 3% of the estimate, whichever is
+    // larger, plus a 64 KiB floor — instead of a single frame (which failed on
+    // an 8-byte overshoot).
+    let one_second = (spec.sample_rate as usize).saturating_mul(frame_bytes);
+    let slack = one_second
+        .max(expected_bytes / 32)
+        .saturating_add(64 * 1024)
+        .max(frame_bytes);
     let reader_cap = expected_bytes
-        .checked_add(frame_bytes)
+        .checked_add(slack)
         .ok_or_else(|| audio_buffer_too_large("PCM reader cap overflow"))?;
 
     let mut child = ff::ffmpeg()
