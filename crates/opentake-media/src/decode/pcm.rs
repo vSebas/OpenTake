@@ -498,7 +498,38 @@ pub(super) fn decode_raw_pcm_cancellable(
         stderr: stderr_reader,
     };
     let (status, stdout, stderr) = wait_for_pcm_child(&mut child, readers, cancel)?;
-    validate_pcm_output(path, status, stdout, stderr, reader_cap)
+    let bytes = validate_pcm_output(path, status, stdout, stderr, reader_cap)?;
+    Ok(trim_range_pcm(bytes, range, expected_bytes, frame_bytes))
+}
+
+/// Clamp an EXPLICIT-range decode to its expected frame count.
+///
+/// `reader_cap` deliberately tolerates an over-long decode (resampler flush,
+/// duration-metadata rounding, decoder-delay slack) so a bounded request never
+/// errors on a few surplus samples. But those surplus samples must not reach the
+/// export retimer: `retime_pcm_to_len_with_control` stretches the WHOLE decoded
+/// buffer across the clip's target length, so ~1s of slack compressed into a
+/// 100 ms slot skews pitch/content badly. For an explicit range we therefore cap
+/// the buffer to the expected frame count. FFmpeg compensates AAC encoder-delay
+/// (start priming) via the container edit list on an input seek, so the surplus
+/// is trailing — truncate the tail. Whole-file decodes (`range == None`) keep
+/// their flush tail, where `expected_bytes` is only a probe estimate.
+///
+/// NOTE: sample-exactness for primed lossy codecs should still be verified
+/// against real footage; this bound removes the gross stretch corruption.
+fn trim_range_pcm(
+    mut bytes: Vec<u8>,
+    range: Option<(f64, f64)>,
+    expected_bytes: usize,
+    frame_bytes: usize,
+) -> Vec<u8> {
+    if range.is_some() && frame_bytes > 0 {
+        let cap = (expected_bytes / frame_bytes) * frame_bytes; // whole frames
+        if cap > 0 && bytes.len() > cap {
+            bytes.truncate(cap);
+        }
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -537,6 +568,35 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(44 + data_len as usize, 0);
         std::fs::write(path, wav).expect("write wav fixture");
+    }
+
+    #[test]
+    fn trim_range_pcm_caps_explicit_range_but_not_whole_file() {
+        let frame_bytes = 4; // mono f32
+        let expected = 40; // 10 frames
+        // Explicit range with a surplus (flush/rounding slack): capped to
+        // whole frames, no more than expected.
+        let over = vec![0u8; expected + 17];
+        let trimmed = trim_range_pcm(over, Some((0.0, 1.0)), expected, frame_bytes);
+        assert_eq!(trimmed.len(), expected);
+        // Exactly expected: unchanged.
+        let exact = vec![7u8; expected];
+        assert_eq!(
+            trim_range_pcm(exact.clone(), Some((0.0, 1.0)), expected, frame_bytes),
+            exact
+        );
+        // Whole-file decode (range None): the flush tail is kept.
+        let whole = vec![0u8; expected + 17];
+        assert_eq!(
+            trim_range_pcm(whole.clone(), None, expected, frame_bytes).len(),
+            whole.len()
+        );
+        // Under expected (short recording): never padded/extended.
+        let short = vec![0u8; expected - 8];
+        assert_eq!(
+            trim_range_pcm(short.clone(), Some((0.0, 1.0)), expected, frame_bytes),
+            short
+        );
     }
 
     #[test]
